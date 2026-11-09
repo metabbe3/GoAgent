@@ -98,3 +98,140 @@ func TestAgentLoopWithToolCall(t *testing.T) {
 		t.Errorf("conversation history missing tool result")
 	}
 }
+
+func TestParallelToolCallsDeterministicOrder(t *testing.T) {
+	step := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		step++
+		var resp llm.ChatResponse
+		if step == 1 {
+			// First response: request 2 tools simultaneously
+			resp = llm.ChatResponse{
+				Choices: []llm.ChatChoice{
+					{
+						Message: llm.ChatMessage{
+							Role: "assistant",
+							ToolCalls: []llm.ToolCall{
+								{
+									ID:   "call_first",
+									Type: "function",
+									Function: llm.FunctionCall{
+										Name:      "list_dir",
+										Arguments: `{"path":"."}`,
+									},
+								},
+								{
+									ID:   "call_second",
+									Type: "function",
+									Function: llm.FunctionCall{
+										Name:      "run_command",
+										Arguments: `{"cmd":"echo 'second tool result'"}`,
+									},
+								},
+							},
+						},
+						FinishReason: "tool_calls",
+					},
+				},
+			}
+		} else {
+			// Second response: final answer
+			resp = llm.ChatResponse{
+				Choices: []llm.ChatChoice{
+					{
+						Message: llm.ChatMessage{
+							Role:    "assistant",
+							Content: "Completed parallel tasks.",
+						},
+						FinishReason: "stop",
+					},
+				},
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		LLMBaseURL: server.URL,
+		LLMAPIKey:  "mock-key",
+		LLMModel:   "mock-model",
+		AllowShell: false,
+	}
+
+	llmClient := llm.NewClient(cfg)
+	reg := tools.NewRegistry(cfg)
+	agentLoop := NewLoop(llmClient, reg, 5)
+
+	finalText, messages, err := agentLoop.Run(context.Background(), "run parallel diagnostics", nil)
+	if err != nil {
+		t.Fatalf("agent loop failed: %v", err)
+	}
+
+	if finalText != "Completed parallel tasks." {
+		t.Errorf("unexpected final text: %s", finalText)
+	}
+
+	// Verify that tool results appear in exact deterministic order: call_first, then call_second
+	var toolResults []llm.ChatMessage
+	for _, m := range messages {
+		if m.Role == "tool" {
+			toolResults = append(toolResults, m)
+		}
+	}
+
+	if len(toolResults) != 2 {
+		t.Fatalf("expected 2 tool results, got %d", len(toolResults))
+	}
+
+	if toolResults[0].ToolCallID != "call_first" {
+		t.Errorf("expected first tool result to be call_first, got: %s", toolResults[0].ToolCallID)
+	}
+	if toolResults[1].ToolCallID != "call_second" {
+		t.Errorf("expected second tool result to be call_second, got: %s", toolResults[1].ToolCallID)
+	}
+}
+
+func TestToolResultTruncation(t *testing.T) {
+	longOutput := strings.Repeat("X", 10000)
+	truncated := TruncateToolOutput(longOutput, 8000)
+
+	if !strings.HasPrefix(truncated, strings.Repeat("X", 8000)) {
+		t.Errorf("expected prefix of 8000 characters")
+	}
+	if !strings.Contains(truncated, "...[truncated 2000 bytes]") {
+		t.Errorf("expected truncation footer, got: %s", truncated[7990:])
+	}
+	if len(truncated) > 8100 {
+		t.Errorf("truncated string too long: %d", len(truncated))
+	}
+}
+
+func TestContextBudgetPruning(t *testing.T) {
+	// Total budget > 60,000 chars
+	oldToolContent := strings.Repeat("LOG LINE\n", 6000)    // ~54,000 chars
+	newToolContent := strings.Repeat("ANOTHER LOG\n", 2000) // ~24,000 chars
+
+	messages := []llm.ChatMessage{
+		{Role: "system", Content: "System prompt"},
+		{Role: "user", Content: "Analyze first log"},
+		{Role: "tool", ToolCallID: "call_1", Content: oldToolContent},
+		{Role: "assistant", Content: "Done with first"},
+		{Role: "user", Content: "Analyze second log"},
+		{Role: "tool", ToolCallID: "call_2", Content: newToolContent},
+	}
+
+	PruneContextBudget(messages, 60000)
+
+	// Oldest tool result should be omitted
+	if messages[2].Content != "[tool result omitted]" {
+		t.Errorf("expected oldest tool result to be omitted, got length %d", len(messages[2].Content))
+	}
+
+	// User and assistant messages must be kept intact
+	if messages[0].Content != "System prompt" || messages[1].Content != "Analyze first log" || messages[3].Content != "Done with first" {
+		t.Errorf("user or assistant message content was corrupted during pruning")
+	}
+}

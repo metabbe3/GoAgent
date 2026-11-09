@@ -5,32 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
-	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
+	"github.com/metabbe3/GoAgent/internal/guardrail"
 	"github.com/metabbe3/GoAgent/internal/llm"
 )
-
-var defaultAllowlist = map[string]bool{
-	"ls":    true,
-	"cat":   true,
-	"tail":  true,
-	"head":  true,
-	"grep":  true,
-	"wc":    true,
-	"du":    true,
-	"df":    true,
-	"ps":    true,
-	"find":  true,
-	"stat":  true,
-	"file":  true,
-	"date":  true,
-	"uname": true,
-	"sleep": true,
-	"echo":  true,
-}
 
 type runCommandInput struct {
 	Cmd        string `json:"cmd"`
@@ -72,11 +52,9 @@ func (r *Registry) handleRunCommand(argsJSON string) (string, error) {
 	allowShell := r.allowShell
 	r.mu.RUnlock()
 
-	// If unrestricted shell is not enabled, enforce safe allowlist
-	if !allowShell {
-		if err := validateAllowlist(cmdStr); err != nil {
-			return "", err
-		}
+	// Enforce command guardrail (blocklist always checked; allowlist checked if !allowShell)
+	if err := guardrail.ValidateCommand(cmdStr, allowShell); err != nil {
+		return "", err
 	}
 
 	timeoutSec := in.TimeoutSec
@@ -106,41 +84,7 @@ func (r *Registry) handleRunCommand(argsJSON string) (string, error) {
 	return res, nil
 }
 
-// validateAllowlist ensures all sub-commands in pipelines/chains belong to the allowlist.
+// validateAllowlist delegates to the command guardrail for safe mode checks.
 func validateAllowlist(cmdStr string) error {
-	// Disallow write redirection in safe mode
-	if strings.Contains(cmdStr, ">") {
-		return fmt.Errorf("file redirection '>' is not permitted in safe mode. Set GOAGENT_ALLOW_SHELL=true to enable write operations")
-	}
-
-	// Split by delimiters: ;, &&, ||, |, &
-	replacer := strings.NewReplacer("&&", ";", "||", ";", "|", ";", "&", ";")
-	normalized := replacer.Replace(cmdStr)
-	segments := strings.Split(normalized, ";")
-
-	for _, seg := range segments {
-		seg = strings.TrimSpace(seg)
-		if seg == "" {
-			continue
-		}
-
-		fields := strings.Fields(seg)
-		if len(fields) == 0 {
-			continue
-		}
-
-		rawBinary := fields[0]
-		binary := filepath.Base(rawBinary)
-
-		if !defaultAllowlist[binary] {
-			keys := make([]string, 0, len(defaultAllowlist))
-			for k := range defaultAllowlist {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			return fmt.Errorf("command '%s' is not in the safe allowlist (%s). Set GOAGENT_ALLOW_SHELL=true to allow all commands", binary, strings.Join(keys, ", "))
-		}
-	}
-
-	return nil
+	return guardrail.ValidateCommand(cmdStr, false)
 }

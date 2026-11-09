@@ -13,6 +13,7 @@ import (
 
 	"github.com/metabbe3/GoAgent/internal/agent"
 	"github.com/metabbe3/GoAgent/internal/config"
+	"github.com/metabbe3/GoAgent/internal/guardrail"
 	"github.com/metabbe3/GoAgent/internal/llm"
 )
 
@@ -311,10 +312,11 @@ func (b *Bot) handleIncomingMessage(ctx context.Context, msg *Message) {
 	}
 
 	if text == "/start" {
-		intro := "*GoAgent v0.1* — General-Purpose Log Analysis & Diagnostic Agent\n\n" +
-			"I can inspect logs, cluster recurring patterns, detect anomalies with self-learning, and run diagnostic shell commands.\n\n" +
+		intro := "*GoAgent v0.2* — General-Purpose Log Analysis & Diagnostic Agent\n\n" +
+			"Equipped with Hermes-grade pattern intelligence, multi-tool parallel reasoning, and zero-leak guardrails.\n\n" +
 			"Try commands like:\n" +
 			"- `Analyze /var/log/system.log`\n" +
+			"- `Show timeline of errors in app.log`\n" +
 			"- `Show recent errors in app.log`\n" +
 			"- `List files in current directory`"
 		_ = b.SendMessage(ctx, chatID, intro)
@@ -335,7 +337,10 @@ func (b *Bot) handleIncomingMessage(ctx context.Context, msg *Message) {
 	}
 	b.chatHistory[chatID] = newHistory
 
-	if err := b.SendMessage(ctx, chatID, reply); err != nil {
+	// Filter reply with guardrail (secret redaction -> strip markup -> leak protection -> cap 3800)
+	filteredReply := guardrail.FilterReply(reply)
+
+	if err := b.SendMessage(ctx, chatID, filteredReply); err != nil {
 		log.Printf("[tg] failed to send reply to %d: %v", chatID, err)
 	}
 }

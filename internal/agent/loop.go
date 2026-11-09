@@ -4,22 +4,18 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 
+	"github.com/metabbe3/GoAgent/internal/guardrail"
 	"github.com/metabbe3/GoAgent/internal/llm"
 	"github.com/metabbe3/GoAgent/internal/tools"
 )
 
-const SystemPrompt = `You are GoAgent, a general-purpose assistant specializing in log analysis, system diagnostics, and file operations.
-You have access to tools for reading and writing files, inspecting directories, running safe shell commands, and analyzing logs:
-- 'analyze_logs': ALWAYS prefer this tool for analyzing medium or large log files. It uses chunk-parallel processing to cluster log lines into templates, count severity levels, and detect anomalies and new patterns.
-- 'read_log': Read the recent lines (tail) of a log file with optional regex filtering.
-- 'learned_patterns': Inspect historical learned pattern memory across previous log analyses.
-- 'read_file': Read any text file with line offset and limit.
-- 'write_file': Write text content to a file.
-- 'list_dir': List entries and metadata in a directory.
-- 'run_command': Execute read-only diagnostic commands (ls, cat, grep, ps, etc.).
-
-Be concise, accurate, and helpful. Format your responses with Markdown.`
+const (
+	MaxToolResultBytes = 8000
+	MaxContextChars    = 60000
+	MaxConcurrentTools = 4
+)
 
 // Loop manages the iterative conversation cycle between user, LLM, and tools.
 type Loop struct {
@@ -38,6 +34,13 @@ func NewLoop(llmClient *llm.Client, registry *tools.Registry, maxIterations int)
 		registry:      registry,
 		maxIterations: maxIterations,
 	}
+}
+
+type toolResult struct {
+	index      int
+	toolCallID string
+	name       string
+	content    string
 }
 
 // Run executes the agent cycle with a user message and returns the final assistant reply.
@@ -67,6 +70,9 @@ func (l *Loop) Run(ctx context.Context, userText string, history []llm.ChatMessa
 	toolDefs := l.registry.GetDefinitions()
 
 	for iter := 0; iter < l.maxIterations; iter++ {
+		// Prune old tool results if context budget is exceeded (>60,000 chars)
+		PruneContextBudget(messages, MaxContextChars)
+
 		assistantMsg, err := l.llmClient.ChatCompletion(ctx, messages, toolDefs)
 		if err != nil {
 			return "", messages, fmt.Errorf("agent llm error: %w", err)
@@ -79,22 +85,94 @@ func (l *Loop) Run(ctx context.Context, userText string, history []llm.ChatMessa
 			return assistantMsg.Content, messages, nil
 		}
 
-		// Execute tool calls
-		for _, tc := range assistantMsg.ToolCalls {
-			log.Printf("[agent] executing tool %s (id: %s)", tc.Function.Name, tc.ID)
-			output, err := l.registry.Execute(tc.Function.Name, tc.Function.Arguments)
-			if err != nil {
-				output = fmt.Sprintf("Error executing tool: %v", err)
-			}
+		// Parallel execution of tool calls (max 4 concurrent), preserving deterministic order
+		toolCalls := assistantMsg.ToolCalls
+		results := make([]toolResult, len(toolCalls))
+		sem := make(chan struct{}, MaxConcurrentTools)
+		var wg sync.WaitGroup
 
+		for i, tc := range toolCalls {
+			wg.Add(1)
+			go func(idx int, call llm.ToolCall) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				log.Printf("[agent] executing tool %s (id: %s) [worker]", call.Function.Name, call.ID)
+				output, err := l.registry.Execute(call.Function.Name, call.Function.Arguments)
+				if err != nil {
+					output = fmt.Sprintf("Error executing tool: %v", err)
+				}
+
+				// Tool result truncation (cap 8000 bytes + footer)
+				truncated := TruncateToolOutput(output, MaxToolResultBytes)
+
+				// Secret redaction before adding to LLM context
+				redacted, _ := guardrail.Redact(truncated)
+
+				results[idx] = toolResult{
+					index:      idx,
+					toolCallID: call.ID,
+					name:       call.Function.Name,
+					content:    redacted,
+				}
+			}(i, tc)
+		}
+
+		wg.Wait()
+
+		// Append tool results in original slice index order
+		for _, res := range results {
 			messages = append(messages, llm.ChatMessage{
 				Role:       "tool",
-				ToolCallID: tc.ID,
-				Name:       tc.Function.Name,
-				Content:    output,
+				ToolCallID: res.toolCallID,
+				Name:       res.name,
+				Content:    res.content,
 			})
 		}
 	}
 
 	return "Reached maximum tool execution iterations without final conclusion. Please narrow your query.", messages, nil
+}
+
+// TruncateToolOutput caps output to maxBytes with a truncation notice.
+func TruncateToolOutput(output string, maxBytes int) string {
+	if maxBytes <= 0 {
+		maxBytes = MaxToolResultBytes
+	}
+	if len(output) > maxBytes {
+		truncated := len(output) - maxBytes
+		return output[:maxBytes] + fmt.Sprintf("\n...[truncated %d bytes]", truncated)
+	}
+	return output
+}
+
+// PruneContextBudget omits the oldest tool results when total message characters exceed maxChars.
+func PruneContextBudget(messages []llm.ChatMessage, maxChars int) {
+	if maxChars <= 0 {
+		maxChars = MaxContextChars
+	}
+	for {
+		total := 0
+		for _, m := range messages {
+			total += len(m.Content)
+		}
+		if total <= maxChars {
+			break
+		}
+
+		// Find the oldest tool result not yet omitted
+		found := false
+		for i := range messages {
+			if messages[i].Role == "tool" && messages[i].Content != "[tool result omitted]" {
+				messages[i].Content = "[tool result omitted]"
+				found = true
+				break
+			}
+		}
+		if !found {
+			// No more tool results can be omitted
+			break
+		}
+	}
 }

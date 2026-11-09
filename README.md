@@ -1,6 +1,6 @@
-# GoAgent v0.1
+# GoAgent v0.2
 
-GoAgent is an open-source, general-purpose Telegram assistant built in pure Go that specializes in high-speed log analysis, self-learning pattern clustering, and system diagnostics. It connects OpenAI-compatible LLMs to your local environment using chunk-parallel log engines and safe diagnostic tools with zero external dependencies.
+GoAgent is an open-source, general-purpose Telegram assistant built in pure Go that specializes in Hermes-grade log intelligence, self-learning pattern clustering, and system diagnostics with zero-leak guardrails. It connects OpenAI-compatible LLMs to your local environment using chunk-parallel log engines, concurrent multi-tool execution, and multi-tier security boundaries with zero external dependencies.
 
 ---
 
@@ -32,68 +32,90 @@ GoAgent equips the LLM with built-in tools for inspecting systems and analyzing 
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `analyze_logs` | `path`, `top?`, `filter_regex?`, `min_count?` | High-speed chunk-parallel log analysis. Clusters logs into normalized templates, calculates severity distributions, flags anomalies, and updates self-learning pattern memory. |
+| `analyze_logs` | `path`, `top?`, `filter_regex?`, `min_count?`, `compare_baseline?`, `window?` | High-speed chunk-parallel log analysis. Clusters logs into normalized templates, calculates severity distributions, autodetects formats, detects bursts, correlates sequential events, and flags anomalies. |
+| `log_timeline` | `path`, `pattern_regex?`, `around_line?`, `context?` | Inspects surrounding context lines ($\pm N$, up to 50 lines max) around a specific line number or first pattern match, with automatic secret redaction. |
 | `read_log` | `path`, `tail?`, `filter_regex?` | Reads the most recent lines of a log file with optional regex filtering. |
 | `learned_patterns` | `file?` | Retrieves historical pattern memory and frequency statistics across past analyses. |
-| `read_file` | `path`, `offset?`, `limit?` | Reads lines from a file with pagination support. |
+| `read_file` | `path`, `offset?`, `limit?` | Reads lines from a file with pagination support (guarded by allowed roots). |
 | `write_file` | `path`, `content` | Writes text content to a file, automatically creating parent directories. |
 | `list_dir` | `path?` | Lists directory contents with file size, permissions, and timestamps. |
-| `run_command` | `cmd`, `timeout_sec?` | Executes diagnostic shell commands. Guarded by a safe allowlist by default. |
+| `run_command` | `cmd`, `timeout_sec?` | Executes diagnostic shell commands. Enforces permanent destructive command blocklist and safe diagnostic allowlist. |
 
 ---
 
-## How Log Analysis Works
+## Log Intelligence v2
 
-The log analysis engine (`internal/logskill/engine.go`) is engineered for speed on multi-core systems:
+The v0.2 log engine brings Hermes-grade pattern intelligence to unstructured logs:
 
-```
-+---------------------------------------------------------------+
-|                       Target Log File                         |
-|   [Chunk 0: 0-8MB]   [Chunk 1: 8-16MB]   ...  [Chunk K: ... ] |
-+---------------------------------------------------------------+
-           |                    |                        |
-           v                    v                        v
-     +------------+       +------------+           +------------+
-     | Goroutine0 |       | Goroutine1 |    ...    | GoroutineK |
-     +------------+       +------------+           +------------+
-           |                    |                        |
-           +--------------------+------------------------+
-                                |
-                                v
-               +----------------------------------+
-               |  Template Normalization Pipeline |
-               |   1. Timestamps -> {DATE}        |
-               |   2. Time       -> {TIME}        |
-               |   3. IPv4       -> {IP}          |
-               |   4. UUID/Hex   -> {UUID}/{HEX}  |
-               |   5. Numbers    -> {N}           |
-               |   6. Quoted Str -> {STR}         |
-               |   7. File Paths -> {PATH}        |
-               +----------------------------------+
-                                |
-                                v
-               +----------------------------------+
-               |      Merge & Pattern Store       |
-               |   - Total line & level counters  |
-               |   - Top N frequent templates     |
-               |   - Anomaly detection & learning |
-               +----------------------------------+
-```
+### 1. Format Autodetection
+The engine automatically samples the first 100 lines to determine the log format without manual configuration:
+- `json`: Lines parsed as structured JSON; extracts severity level (`level`, `lvl`, `severity`), timestamps (`ts`, `time`, `@timestamp`), and normalizes messages (`msg`, `message`, `error`).
+- `logfmt`: Key-value pairs (`key=value`, `key="value"`); extracts level and normalizes dynamic values.
+- `apache/nginx`: Combined Log Format; clusters HTTP request methods, paths, and status codes (5xx $\to$ ERROR, 4xx $\to$ WARN, 2xx/3xx $\to$ INFO).
+- `syslog`: Standard RFC 3164/5424 syslog lines.
+- `raw`: General unstructured log fallback.
 
-1. **Chunk Splitting**: Files are split into $K$ byte-range chunks ($K = \min(8, \text{size}/8\text{MB})$). Each worker seeks to its range and advances to the next newline boundary to guarantee that every line is read exactly once without locks.
-2. **Template Normalization**: Dynamic variables (timestamps, IP addresses, UUIDs, hex tokens, numbers, quoted strings, file paths) are replaced with unified tokens.
-3. **Aggregation & Anomaly Detection**: Chunks are merged into top frequency statistics. Patterns with frequency $\le \text{min\_count}$ or unseen in past analyses are flagged as anomalies.
+### 2. Frequency Burst Detection (`burst.go`)
+- Calculates a dynamic baseline across time windows (1-minute buckets, or 1-hour buckets for files spanning $>24$ hours).
+- Computes mean and standard deviation per pattern across the timeline.
+- Flags anomalous spikes where $\text{count} > \text{mean} + 3\sigma$ and $\text{count} \ge 5$, outputting top bursts ranked by $z$-score.
+
+### 3. Sequential Event Correlation (`correlation.go`)
+- Tracks consecutive lines across parsed timestamps.
+- Identifies pairs of distinct patterns $(A \to B)$ that repeatedly occur within $\pm 2$ seconds of each other.
+- Filters pairs with frequency $\ge 3$ and reports average time delta in milliseconds.
+
+### 4. 30-Day Historical Baseline Delta (`learn.go`)
+- Maintains 30-day rolling daily occurrence counters (`daily: {"YYYY-MM-DD": count}`).
+- When `compare_baseline=true` is requested in `analyze_logs`:
+  - Patterns exceeding $2\times$ historical daily average are flagged with `spike: true`.
+  - Patterns dropping below $0.5\times$ historical daily average are flagged with `drop: true`.
 
 ---
 
-## Self-Learning Patterns
+## Guardrail Security Layer ("Tidak Ada Yang Keluar")
 
-GoAgent remembers recurring log patterns across sessions:
+GoAgent v0.2 enforces a multi-layered guardrail boundary (`internal/guardrail/`):
 
-- **Storage**: Pattern knowledge is saved under `~/.goagent/patterns/<sanitized-filename>.json`.
-- **Automatic Learning**: Every execution of `analyze_logs` loads the existing store, increments historical occurrence counters, updates `last_seen`, and marks previously unseen templates with `new: true`.
-- **Atomic Writes**: Pattern stores are written to a temporary file and committed using `os.Rename` to guarantee data integrity.
-- **Manual Reset**: To reset pattern memory for a log file, simply delete its corresponding JSON file in `~/.goagent/patterns/`.
+```
+Tool Execution  ──> [Secret Redaction] ──> [Truncation (8KB)] ──> LLM Context
+                                                                        │
+Telegram User   <── [Cap (3800)] <── [Leak Filter] <── [Markup Strip] <──┘
+```
+
+1. **Secret Redaction Pipeline (`secretredact.go`)**:
+   - Redacts sensitive credentials in **all tool outputs** before entering LLM context and in **all replies** before transmission.
+   - Detects API keys: OpenAI (`sk-`), GitHub (`ghp_`, `gho_`, `github_pat_`), AWS (`AKIA`), Slack (`xoxb-`, `xoxp-`), Google (`AIza`).
+   - Detects Bearer tokens and JSON Web Tokens (JWT).
+   - Redacts passwords in database connection strings (`postgres://`, `mysql://`, `mongodb://`, `redis://`, `amqp://`).
+   - Replaces entire private key blocks (`-----BEGIN ... PRIVATE KEY-----`).
+   - Redacts `password=`, `passwd=`, `secret=`, `token=`, `api_key=` assignments.
+   - Replaces email addresses with `[REDACTED:email]`.
+   - Validates credit card numbers with the Luhn checksum algorithm before redacting (`[REDACTED:card]`).
+   - Preserves IPv4 addresses for log analysis by default, with optional masking (`x.x.x.<last-octet>`) via `GOAGENT_MASK_IP=true`.
+
+2. **No-Leak Reply Filter (`replyfilter.go`)**:
+   - Strips internal reasoning markup, HTML comments (`<!-- ... -->`), `<s>` thought tags, raw `system:` lines, and tool-call code blocks.
+   - Replaces accidental system prompt disclosures ("You are GoAgent", "ATURAN", etc.) with safe placeholders.
+   - Enforces a 3800-character cap per reply with a `_(truncated — type "more")_` footer.
+
+3. **Command Guard (`commandguard.go`)**:
+   - Blocklist permanently rejected commands even when `GOAGENT_ALLOW_SHELL=true`:
+     `rm -rf`, `mkfs`, `dd if=.*of=/dev/`, `sudo`, `curl|sh`, `wget|sh`, `> /dev/sd*`, `chmod 777 /`, `shutdown`, `reboot`, `:(){ :|:& };:`.
+   - Default safe mode restricts execution to read-only diagnostics (`ls`, `cat`, `grep`, `tail`, `head`, `ps`, `df`, `du`, `stat`, etc.) and forbids file redirection (`>`).
+
+4. **Path Guard (`pathguard.go`)**:
+   - Validates that all file operations resolve within authorized root directories (`GOAGENT_ALLOWED_ROOTS`).
+   - Evaluates symlinks; symlinks escaping authorized roots are rejected.
+   - Forbids reading `.env*` files by default unless `GOAGENT_ALLOW_ENV=true`.
+
+---
+
+## Agent Loop (Hermes-Grade)
+
+- **Parallel Tool Execution**: When the LLM outputs multiple tool calls in a single step, GoAgent executes them concurrently using a goroutine worker pool (max 4 concurrent) while preserving the original deterministic slice order.
+- **Tool Result Truncation**: Tool outputs are capped at 8,000 bytes with a truncation footer to avoid context blowing.
+- **Context Budget Pruning**: If conversation history exceeds 60,000 characters, GoAgent automatically replaces the oldest tool outputs with `[tool result omitted]`, preserving user instructions and assistant conclusions.
 
 ---
 
@@ -108,17 +130,11 @@ Settings are loaded from `goagent.env` in the current working directory and can 
 | `LLM_API_KEY` | *(empty)* | API key for the LLM provider. |
 | `LLM_MODEL` | `gpt-4o-mini` | Model name for completions and function calling. |
 | `GOAGENT_ADMIN_CHAT_ID` | *(empty)* | Optional Telegram chat ID. When set, only messages from this ID are answered. |
-| `GOAGENT_ALLOW_SHELL` | `false` | When `true`, enables arbitrary shell execution. When `false`, enforces safe allowlist. |
+| `GOAGENT_ALLOW_SHELL` | `false` | When `true`, enables arbitrary shell execution (destructive blocklist still enforced). |
 | `GOAGENT_MAX_ITER` | `8` | Maximum tool execution loop iterations per user prompt. |
-
----
-
-## Security Notes
-
-1. **Safe Shell Allowlist**: By default (`GOAGENT_ALLOW_SHELL=false`), `run_command` only permits read-only diagnostic utilities:
-   `ls`, `cat`, `tail`, `head`, `grep`, `wc`, `du`, `df`, `ps`, `find`, `stat`, `file`, `date`, `uname`.
-   Any attempt to run unapproved binaries or use output redirection (`>`) is rejected.
-2. **Access Control**: Set `GOAGENT_ADMIN_CHAT_ID` in `goagent.env` to restrict the bot to your personal Telegram account so unauthorized users cannot invoke tools.
+| `GOAGENT_MASK_IP` | `false` | When `true`, masks IPv4 addresses to `x.x.x.<last-octet>`. |
+| `GOAGENT_ALLOWED_ROOTS` | `cwd:/var/log:/tmp:~/Library/Logs:~/.goagent` | Colon-separated allowed filesystem roots for file and log tools. |
+| `GOAGENT_ALLOW_ENV` | `false` | When `true`, permits reading `.env*` files. |
 
 ---
 

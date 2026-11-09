@@ -15,7 +15,7 @@ import (
 	"github.com/metabbe3/GoAgent/internal/tools"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	log.Printf("Starting GoAgent v%s...", version)

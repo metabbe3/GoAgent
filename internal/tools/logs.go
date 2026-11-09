@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/metabbe3/GoAgent/internal/guardrail"
 	"github.com/metabbe3/GoAgent/internal/llm"
 	"github.com/metabbe3/GoAgent/internal/logskill"
 )
@@ -20,14 +21,23 @@ type readLogInput struct {
 }
 
 type analyzeLogsInput struct {
-	Path        string `json:"path"`
-	Top         int    `json:"top,omitempty"`
-	FilterRegex string `json:"filter_regex,omitempty"`
-	MinCount    int    `json:"min_count,omitempty"`
+	Path            string `json:"path"`
+	Top             int    `json:"top,omitempty"`
+	FilterRegex     string `json:"filter_regex,omitempty"`
+	MinCount        int    `json:"min_count,omitempty"`
+	CompareBaseline bool   `json:"compare_baseline,omitempty"`
+	Window          string `json:"window,omitempty"`
 }
 
 type learnedPatternsInput struct {
 	File string `json:"file,omitempty"`
+}
+
+type logTimelineInput struct {
+	Path         string `json:"path"`
+	PatternRegex string `json:"pattern_regex,omitempty"`
+	AroundLine   int    `json:"around_line,omitempty"`
+	Context      int    `json:"context,omitempty"`
 }
 
 func (r *Registry) registerLogsTools() {
@@ -63,7 +73,7 @@ func (r *Registry) registerLogsTools() {
 		Type: "function",
 		Function: llm.ToolFunctionDef{
 			Name:        "analyze_logs",
-			Description: "Perform chunk-parallel log analysis, clustering templates, counting severity levels, and detecting anomalies/new patterns with self-learning.",
+			Description: "Perform chunk-parallel log analysis, clustering templates, counting severity levels, detecting bursts, correlations, and anomalies with self-learning.",
 			Parameters: schema(map[string]any{
 				"path": map[string]any{
 					"type":        "string",
@@ -80,6 +90,14 @@ func (r *Registry) registerLogsTools() {
 				"min_count": map[string]any{
 					"type":        "integer",
 					"description": "Threshold count below which a pattern is considered an anomaly (default 1).",
+				},
+				"compare_baseline": map[string]any{
+					"type":        "boolean",
+					"description": "Compare current run with 30-day historical baseline to flag frequency spikes (>2x) or drops (<0.5x).",
+				},
+				"window": map[string]any{
+					"type":        "string",
+					"description": "Optional time window before the latest timestamp in the file (e.g. '1h', '24h', or empty for full file).",
 				},
 			}, []string{"path"}),
 		},
@@ -99,6 +117,33 @@ func (r *Registry) registerLogsTools() {
 			}, nil),
 		},
 	}, r.handleLearnedPatterns)
+
+	// log_timeline
+	r.Register(llm.ToolDefinition{
+		Type: "function",
+		Function: llm.ToolFunctionDef{
+			Name:        "log_timeline",
+			Description: "Inspect context lines around a specific line number or first regex match in a log file (max 50 lines total).",
+			Parameters: schema(map[string]any{
+				"path": map[string]any{
+					"type":        "string",
+					"description": "Path to the log file.",
+				},
+				"pattern_regex": map[string]any{
+					"type":        "string",
+					"description": "Regex pattern to locate the center of the timeline window.",
+				},
+				"around_line": map[string]any{
+					"type":        "integer",
+					"description": "1-based line number to center the context around (used if pattern_regex is omitted).",
+				},
+				"context": map[string]any{
+					"type":        "integer",
+					"description": "Number of lines before and after to display (default 5, max 25).",
+				},
+			}, []string{"path"}),
+		},
+	}, r.handleLogTimeline)
 }
 
 func (r *Registry) handleReadLog(argsJSON string) (string, error) {
@@ -111,7 +156,12 @@ func (r *Registry) handleReadLog(argsJSON string) (string, error) {
 		return "", fmt.Errorf("path is required")
 	}
 
-	f, err := os.Open(in.Path)
+	validPath, err := guardrail.ValidatePath(in.Path)
+	if err != nil {
+		return "", err
+	}
+
+	f, err := os.Open(validPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to open log file %s: %w", in.Path, err)
 	}
@@ -137,7 +187,6 @@ func (r *Registry) handleReadLog(argsJSON string) (string, error) {
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
-	// Ring buffer for tail
 	ring := make([]string, tail)
 	ringPos := 0
 	count := 0
@@ -191,18 +240,25 @@ func (r *Registry) handleAnalyzeLogs(argsJSON string) (string, error) {
 		return "", fmt.Errorf("path is required")
 	}
 
+	validPath, err := guardrail.ValidatePath(in.Path)
+	if err != nil {
+		return "", err
+	}
+
 	r.mu.RLock()
 	storeDir := r.storeDir
 	r.mu.RUnlock()
 
 	opts := logskill.AnalysisOptions{
-		Top:         in.Top,
-		FilterRegex: in.FilterRegex,
-		MinCount:    in.MinCount,
-		StoreDir:    storeDir,
+		Top:             in.Top,
+		FilterRegex:     in.FilterRegex,
+		MinCount:        in.MinCount,
+		StoreDir:        storeDir,
+		CompareBaseline: in.CompareBaseline,
+		Window:          in.Window,
 	}
 
-	res, err := logskill.AnalyzeFile(in.Path, opts)
+	res, err := logskill.AnalyzeFile(validPath, opts)
 	if err != nil {
 		return "", fmt.Errorf("log analysis error: %w", err)
 	}
@@ -238,4 +294,111 @@ func (r *Registry) handleLearnedPatterns(argsJSON string) (string, error) {
 	}
 
 	return string(data), nil
+}
+
+func (r *Registry) handleLogTimeline(argsJSON string) (string, error) {
+	var in logTimelineInput
+	if err := json.Unmarshal([]byte(argsJSON), &in); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+
+	if in.Path == "" {
+		return "", fmt.Errorf("path is required")
+	}
+
+	validPath, err := guardrail.ValidatePath(in.Path)
+	if err != nil {
+		return "", err
+	}
+
+	f, err := os.Open(validPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open file %s: %w", in.Path, err)
+	}
+	defer f.Close()
+
+	ctxCount := in.Context
+	if ctxCount <= 0 {
+		ctxCount = 5
+	}
+	if ctxCount > 25 {
+		ctxCount = 25
+	}
+
+	// First pass or locate target line
+	var targetLine int
+	var filterRe *regexp.Regexp
+	if in.PatternRegex != "" {
+		compiled, err := regexp.Compile(in.PatternRegex)
+		if err != nil {
+			return "", fmt.Errorf("invalid pattern regex '%s': %w", in.PatternRegex, err)
+		}
+		filterRe = compiled
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	var allLines []string
+	lineNum := 0
+	foundMatch := false
+
+	for scanner.Scan() {
+		lineNum++
+		text := scanner.Text()
+		allLines = append(allLines, text)
+
+		if !foundMatch && filterRe != nil && filterRe.MatchString(text) {
+			targetLine = lineNum
+			foundMatch = true
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("error reading log file: %w", err)
+	}
+
+	if filterRe != nil && !foundMatch {
+		return fmt.Sprintf("pattern '%s' not found in %s", in.PatternRegex, in.Path), nil
+	}
+
+	if targetLine == 0 {
+		if in.AroundLine > 0 {
+			targetLine = in.AroundLine
+		} else {
+			targetLine = 1
+		}
+	}
+
+	start := targetLine - ctxCount
+	if start < 1 {
+		start = 1
+	}
+	end := targetLine + ctxCount
+	if end > len(allLines) {
+		end = len(allLines)
+	}
+
+	// Cap total output lines to 50
+	if end-start+1 > 50 {
+		end = start + 49
+		if end > len(allLines) {
+			end = len(allLines)
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Timeline around line %d for %s (lines %d-%d of %d):\n",
+		targetLine, in.Path, start, end, len(allLines)))
+
+	for i := start; i <= end; i++ {
+		prefix := "  "
+		if i == targetLine {
+			prefix = "> "
+		}
+		sb.WriteString(fmt.Sprintf("%s%4d | %s\n", prefix, i, allLines[i-1]))
+	}
+
+	redacted, _ := guardrail.Redact(sb.String())
+	return redacted, nil
 }

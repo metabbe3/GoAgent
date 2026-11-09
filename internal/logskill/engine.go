@@ -2,12 +2,14 @@ package logskill
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,19 +34,25 @@ type PatternStat struct {
 
 // AnalysisResult represents the final structured JSON output of analyze_logs.
 type AnalysisResult struct {
-	TotalLines  int64            `json:"total_lines"`
-	Levels      map[string]int64 `json:"levels"`
-	TopPatterns []PatternStat    `json:"top_patterns"`
-	Anomalies   []PatternStat    `json:"anomalies"`
+	Format       string            `json:"format"`
+	TotalLines   int64             `json:"total_lines"`
+	Levels       map[string]int64  `json:"levels"`
+	TopPatterns  []PatternStat     `json:"top_patterns"`
+	Anomalies    []PatternStat     `json:"anomalies"`
+	Bursts       []BurstStat       `json:"bursts,omitempty"`
+	Correlations []CorrelationStat `json:"correlations,omitempty"`
+	Changes      []ChangeStat      `json:"changes,omitempty"`
 }
 
 // AnalysisOptions configures the log analysis engine.
 type AnalysisOptions struct {
-	Top         int    `json:"top,omitempty"`
-	FilterRegex string `json:"filter_regex,omitempty"`
-	MinCount    int    `json:"min_count,omitempty"`
-	StoreDir    string `json:"store_dir,omitempty"`
-	NumChunks   int    `json:"num_chunks,omitempty"` // For testing chunking
+	Top             int    `json:"top,omitempty"`
+	FilterRegex     string `json:"filter_regex,omitempty"`
+	MinCount        int    `json:"min_count,omitempty"`
+	StoreDir        string `json:"store_dir,omitempty"`
+	NumChunks       int    `json:"num_chunks,omitempty"` // For testing chunking
+	CompareBaseline bool   `json:"compare_baseline,omitempty"`
+	Window          string `json:"window,omitempty"` // "1h", "24h", or empty for full file
 }
 
 var (
@@ -79,17 +87,17 @@ var (
 
 	// Level detector regex
 	reLevel = regexp.MustCompile(`(?:\b|\[)(FATAL|CRITICAL|PANIC|ERROR|ERR|WARN|WARNING|INFO|DEBUG|TRACE)(?:\]|\b|:)`)
+
+	// Formats detection regexes
+	reApacheCombined = regexp.MustCompile(`^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"([A-Z]+)\s+([^"\s]+)[^"]*"\s+(\d{3})\s+(\d+|-)`)
+	reSyslogHeader   = regexp.MustCompile(`^(?:<\d+>)?(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\b`)
+	reLogfmtKeyVal   = regexp.MustCompile(`\b([a-zA-Z0-9_.-]+)=(?:"[^"]*"|'[^']*'|\S+)`)
+	reApacheTS       = regexp.MustCompile(`\[(\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2}(?:\s+[+-]\d{4})?)\]`)
+	reSyslogTS       = regexp.MustCompile(`\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(\d{2}:\d{2}:\d{2})\b`)
+	reTimestampGen   = regexp.MustCompile(`\b\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b`)
 )
 
 // NormalizeLine converts a raw log line into a generalized pattern template.
-// Order of normalization:
-// 1. ISO/date timestamps -> {DATE}
-// 2. HH:MM:SS -> {TIME}
-// 3. IPv4 -> {IP}
-// 4. UUID / hex-panjang -> {UUID}/{HEX}
-// 5. angka (int/float, 1.234,56, duration 12ms/3.2s) -> {N}
-// 6. string dalam quotes -> {STR} (only if len > 4)
-// 7. path /foo/bar.js:123 -> {PATH}
 func NormalizeLine(line string) string {
 	// 1. ISO timestamps & dates
 	s := reISO8601.ReplaceAllString(line, "{DATE}")
@@ -104,22 +112,21 @@ func NormalizeLine(line string) string {
 	// 4. UUID
 	s = reUUID.ReplaceAllString(s, "{UUID}")
 
-	// 4b. Long HEX (avoid pure digits which belong to numbers)
+	// 4b. Long HEX
 	s = reHexCandidates.ReplaceAllStringFunc(s, func(match string) string {
 		if strings.HasPrefix(match, "0x") || strings.HasPrefix(match, "0X") {
 			return "{HEX}"
 		}
-		// If it contains at least one hex letter [a-fA-F]
 		for i := 0; i < len(match); i++ {
 			c := match[i]
 			if (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
 				return "{HEX}"
 			}
 		}
-		return match // Keep pure digits for step 5
+		return match
 	})
 
-	// 5. Numbers: Durations, Formatted numbers, Floats, Integers
+	// 5. Numbers
 	s = reDuration.ReplaceAllString(s, "{N}")
 	s = reEuroNum.ReplaceAllString(s, "{N}")
 	s = reUSNum.ReplaceAllString(s, "{N}")
@@ -147,7 +154,6 @@ func NormalizeLine(line string) string {
 func DetectLevel(line string) string {
 	upper := strings.ToUpper(line)
 
-	// Check explicit key-value levels first
 	if strings.Contains(upper, "LEVEL=FATAL") || strings.Contains(upper, `"LEVEL":"FATAL"`) || strings.Contains(upper, "LEVEL=CRITICAL") {
 		return "FATAL"
 	}
@@ -183,22 +189,305 @@ func DetectLevel(line string) string {
 	return "OTHER"
 }
 
-type chunkResult struct {
-	lineCount int64
-	levels    map[string]int64
-	patterns  map[string]*PatternData
-	err       error
+// DetectFormat samples the first 100 non-empty lines to detect the log format:
+// "json", "logfmt", "apache/nginx", "syslog", or fallback "raw".
+func DetectFormat(logPath string) string {
+	f, err := os.Open(logPath)
+	if err != nil {
+		return "raw"
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 512*1024)
+
+	var lines []string
+	for scanner.Scan() && len(lines) < 100 {
+		t := strings.TrimSpace(scanner.Text())
+		if t != "" {
+			lines = append(lines, t)
+		}
+	}
+
+	if len(lines) == 0 {
+		return "raw"
+	}
+
+	total := len(lines)
+	jsonCount := 0
+	logfmtCount := 0
+	apacheCount := 0
+	syslogCount := 0
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
+			var dummy map[string]any
+			if json.Unmarshal([]byte(line), &dummy) == nil {
+				jsonCount++
+			}
+		}
+		if reApacheCombined.MatchString(line) {
+			apacheCount++
+		}
+		if reSyslogHeader.MatchString(line) {
+			syslogCount++
+		}
+		pairs := reLogfmtKeyVal.FindAllString(line, -1)
+		if len(pairs) >= 2 {
+			logfmtCount++
+		}
+	}
+
+	if float64(jsonCount)/float64(total) >= 0.7 {
+		return "json"
+	}
+	if float64(apacheCount)/float64(total) >= 0.6 {
+		return "apache/nginx"
+	}
+	if float64(syslogCount)/float64(total) >= 0.6 {
+		return "syslog"
+	}
+	if float64(logfmtCount)/float64(total) >= 0.6 {
+		return "logfmt"
+	}
+
+	return "raw"
 }
 
-// AnalyzeFile performs chunk-parallel log analysis with self-learning pattern detection.
+// ParseTimestamp extracts a timestamp from a raw log line across common formats.
+func ParseTimestamp(line string) (time.Time, bool) {
+	// 1. ISO8601 / Date + Time / RFC3339
+	if m := reTimestampGen.FindString(line); m != "" {
+		if t, ok := parseTimeString(m); ok {
+			return t, true
+		}
+	}
+
+	// 2. Apache combined format: [10/Oct/2000:13:55:36 -0700]
+	if m := reApacheTS.FindStringSubmatch(line); len(m) > 1 {
+		if t, err := time.Parse("02/Jan/2006:15:04:05 -0700", m[1]); err == nil {
+			return t, true
+		}
+		if t, err := time.Parse("02/Jan/2006:15:04:05", m[1]); err == nil {
+			return t, true
+		}
+	}
+
+	// 3. Syslog format: Oct 11 22:14:15
+	if m := reSyslogTS.FindString(line); m != "" {
+		currYear := time.Now().Year()
+		withYear := fmt.Sprintf("%d %s", currYear, m)
+		if t, err := time.Parse("2006 Jan _2 15:04:05", withYear); err == nil {
+			return t, true
+		}
+	}
+
+	return time.Time{}, false
+}
+
+func parseTimeString(s string) (time.Time, bool) {
+	formats := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05.999",
+		"2006-01-02 15:04:05",
+		"2006/01/02 15:04:05",
+		"2006-01-02T15:04:05",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// ProcessLine extracts pattern, level, and timestamp based on detected format.
+func ProcessLine(line string, format string) (string, string, time.Time, bool) {
+	var (
+		pat   string
+		lvl   string
+		ts    time.Time
+		hasTS bool
+	)
+
+	switch format {
+	case "json":
+		var j map[string]any
+		if err := json.Unmarshal([]byte(line), &j); err == nil {
+			// Extract level
+			for _, k := range []string{"level", "lvl", "severity", "log_level", "log.level"} {
+				if val, ok := j[k]; ok {
+					if s, ok := val.(string); ok && s != "" {
+						u := strings.ToUpper(s)
+						switch u {
+						case "FATAL", "CRITICAL", "PANIC":
+							lvl = "FATAL"
+						case "ERROR", "ERR":
+							lvl = "ERROR"
+						case "WARN", "WARNING":
+							lvl = "WARN"
+						case "INFO":
+							lvl = "INFO"
+						case "DEBUG", "TRACE":
+							lvl = "DEBUG"
+						}
+						break
+					}
+				}
+			}
+
+			// Extract timestamp
+			for _, k := range []string{"ts", "time", "timestamp", "@timestamp", "datetime"} {
+				if val, ok := j[k]; ok {
+					if s, ok := val.(string); ok {
+						if t, ok := parseTimeString(s); ok {
+							ts = t
+							hasTS = true
+							break
+						}
+					} else if f, ok := val.(float64); ok {
+						if f > 1e11 {
+							ts = time.UnixMilli(int64(f))
+							hasTS = true
+							break
+						} else if f > 1e8 {
+							ts = time.Unix(int64(f), 0)
+							hasTS = true
+							break
+						}
+					}
+				}
+			}
+
+			// Extract message for template pattern
+			for _, k := range []string{"msg", "message", "error", "text", "payload"} {
+				if val, ok := j[k]; ok {
+					if s, ok := val.(string); ok && s != "" {
+						pat = NormalizeLine(s)
+						break
+					}
+				}
+			}
+		}
+
+	case "apache/nginx":
+		if m := reApacheCombined.FindStringSubmatch(line); len(m) >= 7 {
+			status, _ := strconv.Atoi(m[5])
+			if status >= 500 {
+				lvl = "ERROR"
+			} else if status >= 400 {
+				lvl = "WARN"
+			} else {
+				lvl = "INFO"
+			}
+
+			if t, ok := ParseTimestamp(line); ok {
+				ts = t
+				hasTS = true
+			}
+
+			// Normalized pattern: {IP} - - [{DATE}] "METHOD PATH" STATUS {N}
+			pat = fmt.Sprintf("{IP} - - [{DATE}] \"%s %s\" %s {N}", m[3], NormalizeLine(m[4]), m[5])
+		}
+
+	case "logfmt":
+		if t, ok := ParseTimestamp(line); ok {
+			ts = t
+			hasTS = true
+		}
+		// Extract level if present: level=info
+		if m := regexp.MustCompile(`(?i)\b(?:level|lvl)=([a-zA-Z]+)\b`).FindStringSubmatch(line); len(m) > 1 {
+			u := strings.ToUpper(m[1])
+			switch u {
+			case "FATAL", "CRITICAL", "PANIC":
+				lvl = "FATAL"
+			case "ERROR", "ERR":
+				lvl = "ERROR"
+			case "WARN", "WARNING":
+				lvl = "WARN"
+			case "INFO":
+				lvl = "INFO"
+			case "DEBUG", "TRACE":
+				lvl = "DEBUG"
+			}
+		}
+		pat = NormalizeLine(line)
+	}
+
+	// Fallbacks
+	if lvl == "" {
+		lvl = DetectLevel(line)
+	}
+	if pat == "" {
+		pat = NormalizeLine(line)
+	}
+	if !hasTS {
+		if t, ok := ParseTimestamp(line); ok {
+			ts = t
+			hasTS = true
+		}
+	}
+
+	return pat, lvl, ts, hasTS
+}
+
+// findMaxTimestamp scans lines to find the maximum timestamp in the file.
+func findMaxTimestamp(logPath string, format string) (time.Time, bool) {
+	f, err := os.Open(logPath)
+	if err != nil {
+		return time.Time{}, false
+	}
+	defer f.Close()
+
+	// If file is large, seek to near the end (last 512KB)
+	fi, err := f.Stat()
+	if err == nil && fi.Size() > 512*1024 {
+		_, _ = f.Seek(-512*1024, io.SeekEnd)
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 512*1024)
+
+	var maxTS time.Time
+	found := false
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		_, _, ts, hasTS := ProcessLine(line, format)
+		if hasTS {
+			if !found || ts.After(maxTS) {
+				maxTS = ts
+				found = true
+			}
+		}
+	}
+
+	return maxTS, found
+}
+
+type chunkResult struct {
+	lineCount     int64
+	levels        map[string]int64
+	patterns      map[string]*PatternData
+	timedPatterns []TimedPattern
+	err           error
+}
+
+// AnalyzeFile performs chunk-parallel log analysis with format autodetect,
+// burst detection, correlation analysis, and self-learning pattern detection.
 func AnalyzeFile(logPath string, opts AnalysisOptions) (*AnalysisResult, error) {
 	fileInfo, err := os.Stat(logPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat log file %s: %w", logPath, err)
 	}
 
+	format := DetectFormat(logPath)
 	fileSize := fileInfo.Size()
+
 	result := &AnalysisResult{
+		Format: format,
 		Levels: map[string]int64{
 			"FATAL": 0,
 			"ERROR": 0,
@@ -207,16 +496,30 @@ func AnalyzeFile(logPath string, opts AnalysisOptions) (*AnalysisResult, error) 
 			"DEBUG": 0,
 			"OTHER": 0,
 		},
-		TopPatterns: []PatternStat{},
-		Anomalies:   []PatternStat{},
+		TopPatterns:  []PatternStat{},
+		Anomalies:    []PatternStat{},
+		Bursts:       []BurstStat{},
+		Correlations: []CorrelationStat{},
+		Changes:      []ChangeStat{},
 	}
 
 	if fileSize == 0 {
 		return result, nil
 	}
 
-	// Calculate chunk count K
-	// K = min(8, size/(8MB)) minimal 1
+	// Window cutoff calculation if window is specified (e.g. "1h", "24h")
+	var cutoffTime time.Time
+	hasWindowFilter := false
+	if opts.Window != "" {
+		if dur, err := time.ParseDuration(opts.Window); err == nil && dur > 0 {
+			if maxTS, ok := findMaxTimestamp(logPath, format); ok {
+				cutoffTime = maxTS.Add(-dur)
+				hasWindowFilter = true
+			}
+		}
+	}
+
+	// Calculate chunk count K = min(8, size/(8MB)) minimal 1
 	k := int(fileSize / (8 * 1024 * 1024))
 	if k > 8 {
 		k = 8
@@ -230,7 +533,6 @@ func AnalyzeFile(logPath string, opts AnalysisOptions) (*AnalysisResult, error) 
 
 	chunkSize := fileSize / int64(k)
 
-	// Compile filter regex if provided
 	var filterRe *regexp.Regexp
 	if opts.FilterRegex != "" {
 		compiled, err := regexp.Compile(opts.FilterRegex)
@@ -240,9 +542,8 @@ func AnalyzeFile(logPath string, opts AnalysisOptions) (*AnalysisResult, error) 
 		filterRe = compiled
 	}
 
-	// Goroutine per chunk (worker pool up to 8)
 	var wg sync.WaitGroup
-	resultsChan := make(chan chunkResult, k)
+	chunkResults := make([]chunkResult, k)
 
 	for i := 0; i < k; i++ {
 		start := int64(i) * chunkSize
@@ -257,7 +558,7 @@ func AnalyzeFile(logPath string, opts AnalysisOptions) (*AnalysisResult, error) 
 
 			f, err := os.Open(logPath)
 			if err != nil {
-				resultsChan <- chunkResult{err: fmt.Errorf("chunk %d open error: %w", chunkIndex, err)}
+				chunkResults[chunkIndex] = chunkResult{err: fmt.Errorf("chunk %d open error: %w", chunkIndex, err)}
 				return
 			}
 			defer f.Close()
@@ -266,40 +567,35 @@ func AnalyzeFile(logPath string, opts AnalysisOptions) (*AnalysisResult, error) 
 
 			// Seek to start position
 			if startByte > 0 {
-				// Check preceding byte to determine if we are already at line start
 				prevByte := make([]byte, 1)
 				if _, err := f.ReadAt(prevByte, startByte-1); err == nil && prevByte[0] == '\n' {
-					// We are exactly at the beginning of a line
 					if _, err := f.Seek(startByte, io.SeekStart); err != nil {
-						resultsChan <- chunkResult{err: fmt.Errorf("chunk %d seek error: %w", chunkIndex, err)}
+						chunkResults[chunkIndex] = chunkResult{err: fmt.Errorf("chunk %d seek error: %w", chunkIndex, err)}
 						return
 					}
 				} else {
-					// We are in the middle of a line; seek and discard to next newline
 					if _, err := f.Seek(startByte, io.SeekStart); err != nil {
-						resultsChan <- chunkResult{err: fmt.Errorf("chunk %d seek error: %w", chunkIndex, err)}
+						chunkResults[chunkIndex] = chunkResult{err: fmt.Errorf("chunk %d seek error: %w", chunkIndex, err)}
 						return
 					}
 					reader := bufio.NewReaderSize(f, 64*1024)
 					discarded, err := reader.ReadBytes('\n')
 					currentPos += int64(len(discarded))
 					if err != nil {
-						// Reached EOF while skipping
-						resultsChan <- chunkResult{
+						chunkResults[chunkIndex] = chunkResult{
 							levels:   make(map[string]int64),
 							patterns: make(map[string]*PatternData),
 						}
 						return
 					}
-					// Seek file to currentPos for a clean new reader
 					if _, err := f.Seek(currentPos, io.SeekStart); err != nil {
-						resultsChan <- chunkResult{err: fmt.Errorf("chunk %d seek error: %w", chunkIndex, err)}
+						chunkResults[chunkIndex] = chunkResult{err: fmt.Errorf("chunk %d seek error: %w", chunkIndex, err)}
 						return
 					}
 				}
 			} else {
 				if _, err := f.Seek(0, io.SeekStart); err != nil {
-					resultsChan <- chunkResult{err: fmt.Errorf("chunk %d seek error: %w", chunkIndex, err)}
+					chunkResults[chunkIndex] = chunkResult{err: fmt.Errorf("chunk %d seek error: %w", chunkIndex, err)}
 					return
 				}
 			}
@@ -320,7 +616,6 @@ func AnalyzeFile(logPath string, opts AnalysisOptions) (*AnalysisResult, error) 
 					currentPos += int64(len(lineBytes))
 					lineStr := strings.TrimRight(string(lineBytes), "\r\n")
 
-					// Apply filter if requested
 					if filterRe != nil && !filterRe.MatchString(lineStr) {
 						if err != nil {
 							break
@@ -328,11 +623,26 @@ func AnalyzeFile(logPath string, opts AnalysisOptions) (*AnalysisResult, error) 
 						continue
 					}
 
+					pat, lvl, ts, hasTS := ProcessLine(lineStr, format)
+
+					// Filter by time window if requested
+					if hasWindowFilter && hasTS && ts.Before(cutoffTime) {
+						if err != nil {
+							break
+						}
+						continue
+					}
+
 					cRes.lineCount++
-					lvl := DetectLevel(lineStr)
 					cRes.levels[lvl]++
 
-					pat := NormalizeLine(lineStr)
+					if hasTS {
+						cRes.timedPatterns = append(cRes.timedPatterns, TimedPattern{
+							Timestamp: ts,
+							Pattern:   pat,
+						})
+					}
+
 					if entry, exists := cRes.patterns[pat]; exists {
 						entry.Count++
 					} else {
@@ -356,16 +666,17 @@ func AnalyzeFile(logPath string, opts AnalysisOptions) (*AnalysisResult, error) 
 				}
 			}
 
-			resultsChan <- cRes
+			chunkResults[chunkIndex] = cRes
 		}(i, start, end)
 	}
 
 	wg.Wait()
-	close(resultsChan)
 
-	// Step 3: Merge chunk results
+	// Merge chunk results
 	totalPatterns := make(map[string]*PatternData)
-	for res := range resultsChan {
+	var allTimedPatterns []TimedPattern
+
+	for _, res := range chunkResults {
 		if res.err != nil {
 			return nil, res.err
 		}
@@ -384,10 +695,24 @@ func AnalyzeFile(logPath string, opts AnalysisOptions) (*AnalysisResult, error) 
 				}
 			}
 		}
+		allTimedPatterns = append(allTimedPatterns, res.timedPatterns...)
+	}
+
+	// Run Burst detection and Correlation analysis
+	result.Bursts = DetectBursts(allTimedPatterns)
+	result.Correlations = DetectCorrelations(allTimedPatterns)
+
+	// Baseline comparison if requested
+	storePath, err := GetStorePath(logPath, opts.StoreDir)
+	if opts.CompareBaseline && err == nil {
+		todayStr := time.Now().Format("2006-01-02")
+		changes, _ := CompareWithBaseline(storePath, totalPatterns, todayStr)
+		if changes != nil {
+			result.Changes = changes
+		}
 	}
 
 	// Update self-learning pattern store
-	storePath, err := GetStorePath(logPath, opts.StoreDir)
 	var newPatterns map[string]bool
 	if err == nil {
 		newPatterns, _ = UpdateLearnedPatterns(storePath, totalPatterns, time.Now())
@@ -422,7 +747,6 @@ func AnalyzeFile(logPath string, opts AnalysisOptions) (*AnalysisResult, error) 
 		return allStats[i].Pattern < allStats[j].Pattern
 	})
 
-	// Top N patterns
 	topN := opts.Top
 	if topN <= 0 {
 		topN = 10
@@ -432,8 +756,7 @@ func AnalyzeFile(logPath string, opts AnalysisOptions) (*AnalysisResult, error) 
 	}
 	result.TopPatterns = append(result.TopPatterns, allStats[:topN]...)
 
-	// Step 5: Anomaly detection:
-	// Pola dengan count <= min_count (default 1) ATAU pola yang BELUM ada di pattern store (New == true)
+	// Anomaly detection
 	minCount := int64(opts.MinCount)
 	if minCount <= 0 {
 		minCount = 1

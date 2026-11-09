@@ -227,3 +227,83 @@ func TestAnomaliesMinCount(t *testing.T) {
 		t.Errorf("expected rare pattern to be flagged as anomaly")
 	}
 }
+
+func TestFormatAutodetectJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	jsonLogPath := filepath.Join(tmpDir, "app.jsonl")
+
+	lines := []string{
+		`{"level":"error", "msg":"database connection failed to 192.168.1.5", "ts":"2026-11-09T09:00:00Z"}`,
+		`{"level":"warn", "msg":"high cpu load 92%", "ts":"2026-11-09T09:01:00Z"}`,
+		`{"level":"info", "msg":"service heartbeat ok", "ts":"2026-11-09T09:02:00Z"}`,
+		`{"level":"error", "msg":"database connection failed to 192.168.1.6", "ts":"2026-11-09T09:03:00Z"}`,
+	}
+
+	content := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(jsonLogPath, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write json log: %v", err)
+	}
+
+	res, err := AnalyzeFile(jsonLogPath, AnalysisOptions{
+		Top:      5,
+		StoreDir: filepath.Join(tmpDir, "patterns"),
+	})
+	if err != nil {
+		t.Fatalf("AnalyzeFile failed: %v", err)
+	}
+
+	// Format autodetect: json-lines file -> format=json
+	if res.Format != "json" {
+		t.Errorf("expected format 'json', got '%s'", res.Format)
+	}
+
+	// Level from json field
+	if res.Levels["ERROR"] != 2 {
+		t.Errorf("expected 2 ERROR levels from json field, got %d", res.Levels["ERROR"])
+	}
+	if res.Levels["WARN"] != 1 {
+		t.Errorf("expected 1 WARN level from json field, got %d", res.Levels["WARN"])
+	}
+	if res.Levels["INFO"] != 1 {
+		t.Errorf("expected 1 INFO level from json field, got %d", res.Levels["INFO"])
+	}
+
+	// Check normalized pattern from msg field
+	foundPat := false
+	for _, p := range res.TopPatterns {
+		if strings.Contains(p.Pattern, "database connection failed to {IP}") {
+			foundPat = true
+			if p.Count != 2 {
+				t.Errorf("expected pattern count 2, got %d", p.Count)
+			}
+			if p.Level != "ERROR" {
+				t.Errorf("expected pattern level ERROR, got %s", p.Level)
+			}
+		}
+	}
+	if !foundPat {
+		t.Errorf("expected json pattern 'database connection failed to {IP}' in top patterns: %+v", res.TopPatterns)
+	}
+}
+
+func TestFormatAutodetectOtherFormats(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Apache / Nginx combined
+	webLog := filepath.Join(tmpDir, "access.log")
+	webContent := `127.0.0.1 - - [10/Oct/2026:13:55:36 +0000] "GET /api/users HTTP/1.1" 200 2326
+127.0.0.1 - - [10/Oct/2026:13:55:37 +0000] "POST /api/login HTTP/1.1" 401 512
+127.0.0.1 - - [10/Oct/2026:13:55:38 +0000] "GET /api/error HTTP/1.1" 500 1024
+`
+	_ = os.WriteFile(webLog, []byte(webContent), 0644)
+	resWeb, err := AnalyzeFile(webLog, AnalysisOptions{StoreDir: filepath.Join(tmpDir, "patterns")})
+	if err != nil {
+		t.Fatalf("AnalyzeFile webLog failed: %v", err)
+	}
+	if resWeb.Format != "apache/nginx" {
+		t.Errorf("expected format 'apache/nginx', got %s", resWeb.Format)
+	}
+	if resWeb.Levels["ERROR"] != 1 || resWeb.Levels["WARN"] != 1 || resWeb.Levels["INFO"] != 1 {
+		t.Errorf("unexpected web levels: %+v", resWeb.Levels)
+	}
+}

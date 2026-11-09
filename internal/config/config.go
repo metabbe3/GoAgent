@@ -18,6 +18,9 @@ type Config struct {
 	AdminChatID   int64
 	AllowShell    bool
 	MaxIterations int
+	MaskIP        bool
+	AllowedRoots  string
+	AllowEnv      bool
 }
 
 // Default values
@@ -117,6 +120,27 @@ func LoadFromFile(envPath string) (*Config, error) {
 		}
 	}
 
+	maskIP := false
+	if maskStr := getVal("GOAGENT_MASK_IP", "false"); strings.ToLower(maskStr) == "true" || maskStr == "1" {
+		maskIP = true
+		if os.Getenv("GOAGENT_MASK_IP") == "" {
+			_ = os.Setenv("GOAGENT_MASK_IP", "true")
+		}
+	}
+
+	allowedRoots := getVal("GOAGENT_ALLOWED_ROOTS", "")
+	if allowedRoots != "" && os.Getenv("GOAGENT_ALLOWED_ROOTS") == "" {
+		_ = os.Setenv("GOAGENT_ALLOWED_ROOTS", allowedRoots)
+	}
+
+	allowEnv := false
+	if allowEnvStr := getVal("GOAGENT_ALLOW_ENV", "false"); strings.ToLower(allowEnvStr) == "true" || allowEnvStr == "1" {
+		allowEnv = true
+		if os.Getenv("GOAGENT_ALLOW_ENV") == "" {
+			_ = os.Setenv("GOAGENT_ALLOW_ENV", "true")
+		}
+	}
+
 	return &Config{
 		TelegramToken: telegramToken,
 		LLMBaseURL:    baseURL,
@@ -125,5 +149,8 @@ func LoadFromFile(envPath string) (*Config, error) {
 		AdminChatID:   adminChatID,
 		AllowShell:    allowShell,
 		MaxIterations: maxIter,
+		MaskIP:        maskIP,
+		AllowedRoots:  allowedRoots,
+		AllowEnv:      allowEnv,
 	}, nil
 }

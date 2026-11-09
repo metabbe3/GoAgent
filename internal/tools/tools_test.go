@@ -82,11 +82,23 @@ func TestRunCommandAllowlist(t *testing.T) {
 		t.Errorf("uname should be allowed, got: %s", res)
 	}
 
-	// Disallowed command
+	// Disallowed command blocked by guardrail
 	disallowedArgs, _ := json.Marshal(runCommandInput{
 		Cmd: "rm -rf /tmp/some_file",
 	})
 	res, err = reg.Execute("run_command", string(disallowedArgs))
+	if err != nil {
+		t.Fatalf("Execute should return formatted error message, got: %v", err)
+	}
+	if !strings.Contains(res, "Command blocked by guardrail") {
+		t.Errorf("expected guardrail error message, got: %s", res)
+	}
+
+	// Disallowed command outside allowlist
+	nonAllowlistArgs, _ := json.Marshal(runCommandInput{
+		Cmd: "git status",
+	})
+	res, err = reg.Execute("run_command", string(nonAllowlistArgs))
 	if err != nil {
 		t.Fatalf("Execute should return formatted error message, got: %v", err)
 	}
@@ -181,5 +193,22 @@ func TestReadLogAndAnalyzeLogs(t *testing.T) {
 	}
 	if !strings.Contains(learnRes, "server.log") {
 		t.Errorf("learned patterns missing server.log entry: %s", learnRes)
+	}
+
+	// Test log_timeline
+	timelineArgs, _ := json.Marshal(logTimelineInput{
+		Path:         logFile,
+		PatternRegex: "connection lost",
+		Context:      1,
+	})
+	tlRes, err := reg.Execute("log_timeline", string(timelineArgs))
+	if err != nil {
+		t.Fatalf("log_timeline failed: %v", err)
+	}
+	if !strings.Contains(tlRes, "Timeline around line 2") {
+		t.Errorf("expected timeline around line 2, got: %s", tlRes)
+	}
+	if !strings.Contains(tlRes, "connection lost") {
+		t.Errorf("expected target line in timeline output, got: %s", tlRes)
 	}
 }

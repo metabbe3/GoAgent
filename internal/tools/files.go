@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/metabbe3/GoAgent/internal/guardrail"
 	"github.com/metabbe3/GoAgent/internal/llm"
 )
 
@@ -95,7 +96,12 @@ func (r *Registry) handleReadFile(argsJSON string) (string, error) {
 		return "", fmt.Errorf("path is required")
 	}
 
-	f, err := os.Open(in.Path)
+	validPath, err := guardrail.ValidatePath(in.Path)
+	if err != nil {
+		return "", err
+	}
+
+	f, err := os.Open(validPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to open file %s: %w", in.Path, err)
 	}
@@ -154,12 +160,17 @@ func (r *Registry) handleWriteFile(argsJSON string) (string, error) {
 		return "", fmt.Errorf("path is required")
 	}
 
-	dir := filepath.Dir(in.Path)
+	validPath, err := guardrail.ValidatePath(in.Path)
+	if err != nil {
+		return "", err
+	}
+
+	dir := filepath.Dir(validPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
-	if err := os.WriteFile(in.Path, []byte(in.Content), 0644); err != nil {
+	if err := os.WriteFile(validPath, []byte(in.Content), 0644); err != nil {
 		return "", fmt.Errorf("failed to write file %s: %w", in.Path, err)
 	}
 
@@ -175,7 +186,12 @@ func (r *Registry) handleListDir(argsJSON string) (string, error) {
 		path = "."
 	}
 
-	entries, err := os.ReadDir(path)
+	validPath, err := guardrail.ValidatePath(path)
+	if err != nil {
+		return "", err
+	}
+
+	entries, err := os.ReadDir(validPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read directory %s: %w", path, err)
 	}

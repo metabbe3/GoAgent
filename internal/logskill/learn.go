@@ -3,6 +3,7 @@ package logskill
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,11 +13,21 @@ import (
 
 // PatternRecord stores historical knowledge about a learned log pattern.
 type PatternRecord struct {
-	Count      int64     `json:"count"`
-	FirstSeen  time.Time `json:"first_seen"`
-	LastSeen   time.Time `json:"last_seen"`
-	Sample     string    `json:"sample"`
-	LevelGuess string    `json:"level_guess"`
+	Count      int64            `json:"count"`
+	FirstSeen  time.Time        `json:"first_seen"`
+	LastSeen   time.Time        `json:"last_seen"`
+	Sample     string           `json:"sample"`
+	LevelGuess string           `json:"level_guess"`
+	Daily      map[string]int64 `json:"daily,omitempty"`
+}
+
+// ChangeStat describes a significant divergence from the historical daily baseline.
+type ChangeStat struct {
+	Pattern       string  `json:"pattern"`
+	CurrentCount  int64   `json:"current_count"`
+	HistoricalAvg float64 `json:"historical_avg"`
+	Spike         bool    `json:"spike,omitempty"`
+	Drop          bool    `json:"drop,omitempty"`
 }
 
 // LearnedSummary is a concise summary of a learned pattern for LLM / tools.
@@ -137,7 +148,7 @@ func saveStoreUnlocked(storePath string, store map[string]PatternRecord) error {
 }
 
 // UpdateLearnedPatterns loads the store, merges current patterns, flags new ones,
-// and atomically updates the store file.
+// updates the 30-day daily bucket, and atomically updates the store file.
 func UpdateLearnedPatterns(storePath string, currentPatterns map[string]*PatternData, now time.Time) (map[string]bool, error) {
 	storeMutex.Lock()
 	defer storeMutex.Unlock()
@@ -148,6 +159,8 @@ func UpdateLearnedPatterns(storePath string, currentPatterns map[string]*Pattern
 	}
 
 	isNew := make(map[string]bool)
+	today := now.Format("2006-01-02")
+	cutoffDate := now.AddDate(0, 0, -30).Format("2006-01-02")
 
 	for pat, data := range currentPatterns {
 		if rec, exists := store[pat]; exists {
@@ -159,15 +172,31 @@ func UpdateLearnedPatterns(storePath string, currentPatterns map[string]*Pattern
 			if data.Level != "" && data.Level != "OTHER" {
 				rec.LevelGuess = data.Level
 			}
+			if rec.Daily == nil {
+				rec.Daily = make(map[string]int64)
+			}
+			rec.Daily[today] += data.Count
+
+			// Prune entries older than 30 days
+			for dStr := range rec.Daily {
+				if dStr < cutoffDate {
+					delete(rec.Daily, dStr)
+				}
+			}
+
 			store[pat] = rec
 			isNew[pat] = false
 		} else {
+			daily := map[string]int64{
+				today: data.Count,
+			}
 			store[pat] = PatternRecord{
 				Count:      data.Count,
 				FirstSeen:  now,
 				LastSeen:   now,
 				Sample:     data.Sample,
 				LevelGuess: data.Level,
+				Daily:      daily,
 			}
 			isNew[pat] = true
 		}
@@ -178,6 +207,62 @@ func UpdateLearnedPatterns(storePath string, currentPatterns map[string]*Pattern
 	}
 
 	return isNew, nil
+}
+
+// CompareWithBaseline compares current pattern counts against historical daily averages.
+// Flags patterns with spike:true (count > 2x average) or drop:true (count < 0.5x average).
+func CompareWithBaseline(storePath string, currentPatterns map[string]*PatternData, currentDate string) ([]ChangeStat, error) {
+	storeMutex.Lock()
+	defer storeMutex.Unlock()
+
+	store, err := loadStoreUnlocked(storePath)
+	if err != nil {
+		return nil, err
+	}
+
+	var changes []ChangeStat
+
+	for pat, data := range currentPatterns {
+		rec, exists := store[pat]
+		if !exists || len(rec.Daily) == 0 {
+			continue
+		}
+
+		var histSum int64
+		var histDays int
+
+		for dStr, cnt := range rec.Daily {
+			if dStr != currentDate {
+				histSum += cnt
+				histDays++
+			}
+		}
+
+		if histDays == 0 || histSum == 0 {
+			continue
+		}
+
+		avg := float64(histSum) / float64(histDays)
+		curr := float64(data.Count)
+
+		if curr > 2.0*avg {
+			changes = append(changes, ChangeStat{
+				Pattern:       pat,
+				CurrentCount:  data.Count,
+				HistoricalAvg: math.Round(avg*100) / 100,
+				Spike:         true,
+			})
+		} else if curr < 0.5*avg {
+			changes = append(changes, ChangeStat{
+				Pattern:       pat,
+				CurrentCount:  data.Count,
+				HistoricalAvg: math.Round(avg*100) / 100,
+				Drop:          true,
+			})
+		}
+	}
+
+	return changes, nil
 }
 
 // ListLearnedPatterns returns learned pattern summaries across stores or for a specific file.

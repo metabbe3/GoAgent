@@ -87,3 +87,78 @@ func TestPatternStoreMergeAndNewFlag(t *testing.T) {
 		t.Errorf("expected 3 learned patterns in summary, got %d", len(summaries))
 	}
 }
+
+func TestDailyBucketAndBaselineSpikeDrop(t *testing.T) {
+	tmpDir := t.TempDir()
+	storePath := filepath.Join(tmpDir, "patterns", "server.log.json")
+
+	day1 := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+	day2 := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+	day3 := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
+
+	patSpike := "connection reset by peer"
+	patDrop := "cache lookup successful"
+
+	// Day 1: count 10 for each
+	_, _ = UpdateLearnedPatterns(storePath, map[string]*PatternData{
+		patSpike: {Count: 10, Sample: patSpike, Level: "ERROR"},
+		patDrop:  {Count: 10, Sample: patDrop, Level: "INFO"},
+	}, day1)
+
+	// Day 2: count 10 for each (avg across day 1 and 2 is 10)
+	_, _ = UpdateLearnedPatterns(storePath, map[string]*PatternData{
+		patSpike: {Count: 10, Sample: patSpike, Level: "ERROR"},
+		patDrop:  {Count: 10, Sample: patDrop, Level: "INFO"},
+	}, day2)
+
+	// Verify daily map is populated in store
+	st, err := LoadStore(storePath)
+	if err != nil {
+		t.Fatalf("failed to load store: %v", err)
+	}
+	if st[patSpike].Daily["2026-11-01"] != 10 || st[patSpike].Daily["2026-11-02"] != 10 {
+		t.Errorf("daily map not correctly populated: %+v", st[patSpike].Daily)
+	}
+
+	// Day 3: current run has patSpike count=30 (>2x 10) and patDrop count=2 (<0.5x 10)
+	currentRun := map[string]*PatternData{
+		patSpike: {Count: 30, Sample: patSpike, Level: "ERROR"},
+		patDrop:  {Count: 2, Sample: patDrop, Level: "INFO"},
+	}
+
+	changes, err := CompareWithBaseline(storePath, currentRun, day3.Format("2006-01-02"))
+	if err != nil {
+		t.Fatalf("CompareWithBaseline failed: %v", err)
+	}
+
+	foundSpike := false
+	foundDrop := false
+
+	for _, c := range changes {
+		if c.Pattern == patSpike {
+			if !c.Spike {
+				t.Errorf("expected spike:true for %s, got %+v", patSpike, c)
+			}
+			if c.HistoricalAvg != 10.0 {
+				t.Errorf("expected historical avg 10.0, got %f", c.HistoricalAvg)
+			}
+			foundSpike = true
+		}
+		if c.Pattern == patDrop {
+			if !c.Drop {
+				t.Errorf("expected drop:true for %s, got %+v", patDrop, c)
+			}
+			if c.HistoricalAvg != 10.0 {
+				t.Errorf("expected historical avg 10.0, got %f", c.HistoricalAvg)
+			}
+			foundDrop = true
+		}
+	}
+
+	if !foundSpike {
+		t.Errorf("expected spike change stat not found")
+	}
+	if !foundDrop {
+		t.Errorf("expected drop change stat not found")
+	}
+}
