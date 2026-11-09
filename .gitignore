@@ -1,0 +1,14 @@
+# Binaries
+/bin/
+/goagent
+
+# Environment files
+goagent.env
+*.env.local
+
+# Logs and scratch
+*.log
+/tmp/
+
+# OS artifacts
+.DS_Store
