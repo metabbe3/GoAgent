@@ -9,26 +9,45 @@ GoAgent operates in three modes:
 
 ---
 
-## Architecture & Mesh Mode (GoMesh/1.0)
+## Mesh Mode (GoMesh/1.0)
 
 GoMesh is an HTTP/1.1 JSON-RPC 2.0 orchestration protocol with constant-time token authentication (`X-Mesh-Token`), capability-based routing, long-poll task delivery, and persistent JSONL state replay.
 
 ```
-                      +-------------------+
-                      |   GoAgent Leader  |
-                      |   (:7801 / HTTP)  |
-                      +---------+---------+
-                                |
-             +------------------+------------------+
-             | (X-Mesh-Token, RPC & /nexttask)     |
-             v                                     v
-   +--------------------+                +--------------------+
-   |   Worker 1 (logs)  |                |  Worker 2 (shell)  |
-   |  Local Tools:      |                |  Local Tools:      |
-   |  - analyze_logs    |                |  - run_command     |
-   |  - log_timeline    |                |  - read_file       |
-   |  - read_document   |                |  - generate_pdf    |
-   +--------------------+                +--------------------+
+ [TG User]
+     │ (Telegram Bot API)
+     ▼
++─────────────────────────────────────────────────────────────+
+│                    GoAgent Leader (:7801)                   │
++──────────────────────────────┬──────────────────────────────+
+                               │
+            ┌──────────────────┴──────────────────┐
+            │ long-poll: GET /nexttask?id=...     │
+            │ report & heartbeat: POST /rpc       │
+            ▼                                     ▼
++───────────────────────+             +───────────────────────+
+│   Worker A (logs)     │             │   Worker B (shell)    │
+│ Capabilities: [logs]  │             │ Capabilities: [shell] │
++───────────────────────+             +───────────────────────+
+```
+
+### Quickstart: 3-Terminal Cluster (Inline Env)
+
+Run a complete distributed GoMesh cluster on your local machine across 3 terminals:
+
+**Terminal 1 (Leader / Coordinator):**
+```bash
+GOAGENT_ROLE=leader GOAGENT_MESH_LISTEN=:7801 GOAGENT_MESH_TOKEN=mesh-secret-123 LLM_API_KEY=your-api-key ./bin/goagent
+```
+
+**Terminal 2 (Worker A - Log Specialist):**
+```bash
+GOAGENT_ROLE=worker GOAGENT_LEADER_ADDR=http://127.0.0.1:7801 GOAGENT_MESH_TOKEN=mesh-secret-123 GOAGENT_WORKER_ID=worker-a GOAGENT_CAPABILITIES=logs LLM_API_KEY=your-api-key ./bin/goagent
+```
+
+**Terminal 3 (Worker B - Shell & Diagnostic Specialist):**
+```bash
+GOAGENT_ROLE=worker GOAGENT_LEADER_ADDR=http://127.0.0.1:7801 GOAGENT_MESH_TOKEN=mesh-secret-123 GOAGENT_WORKER_ID=worker-b GOAGENT_CAPABILITIES=shell LLM_API_KEY=your-api-key ./bin/goagent
 ```
 
 ### Protocol Summary
@@ -45,43 +64,6 @@ GoMesh is an HTTP/1.1 JSON-RPC 2.0 orchestration protocol with constant-time tok
   - Leader sweeps workers every 15 seconds. If a worker misses 3 heartbeats (>90 seconds), it is marked dead and its in-flight tasks are automatically requeued.
   - Unfinished missions exceeding `GOAGENT_MISSION_TIMEOUT` (default 1800s) are safely cancelled.
 - **Crash Recovery**: All mission and task transitions append to `data/mesh/state.jsonl` and replay automatically on reboot.
-
----
-
-## Quickstart: 3-Terminal Mesh Cluster
-
-Run a full GoMesh cluster locally in 3 terminals:
-
-### Terminal 1: Mesh Leader (Coordinator)
-```bash
-export GOAGENT_ROLE=leader
-export GOAGENT_MESH_LISTEN=:7801
-export GOAGENT_MESH_TOKEN=secret-mesh-token-123
-export LLM_API_KEY=your-api-key
-./bin/goagent
-```
-
-### Terminal 2: Worker 1 (Log Specialist)
-```bash
-export GOAGENT_ROLE=worker
-export GOAGENT_LEADER_ADDR=http://127.0.0.1:7801
-export GOAGENT_MESH_TOKEN=secret-mesh-token-123
-export GOAGENT_WORKER_ID=worker-logs
-export GOAGENT_CAPABILITIES=logs
-export LLM_API_KEY=your-api-key
-./bin/goagent
-```
-
-### Terminal 3: Worker 2 (Diagnostics Specialist)
-```bash
-export GOAGENT_ROLE=worker
-export GOAGENT_LEADER_ADDR=http://127.0.0.1:7801
-export GOAGENT_MESH_TOKEN=secret-mesh-token-123
-export GOAGENT_WORKER_ID=worker-shell
-export GOAGENT_CAPABILITIES=shell
-export LLM_API_KEY=your-api-key
-./bin/goagent
-```
 
 ---
 
@@ -160,12 +142,25 @@ GoAgent enforces defense-in-depth security at every step:
 
 ## Extending GoAgent
 
-1. **Adding Tools**:
-   Create a new file in `internal/tools/` and register your function in `r.Register()` using `llm.ToolDefinition`.
-2. **Adding Capabilities**:
-   Tag worker nodes using `GOAGENT_CAPABILITIES=gpu,vision,storage`. Subtasks specifying `capability: "gpu"` will only route to workers matching that tag.
-3. **Transport Adapters**:
-   GoMesh uses clean HTTP/1.1 and JSON-RPC 2.0. To bridge GoMesh across custom overlays (WireGuard, Tailscale, mTLS, WebSocket), wrap `net.Listener` in `Server` or provide a custom `http.RoundTripper` in `Client`.
+1. **Adding a Tool**:
+   Implement a handler (`func(argsJSON string) (string, error)`) and register it via `r.Register()` with `llm.ToolDefinition`:
+   ```go
+   r.Register(llm.ToolDefinition{
+       Type: "function",
+       Function: llm.ToolFunctionDef{
+           Name: "my_tool",
+           Description: "Tool description for the model",
+           Parameters: map[string]any{ ... },
+       },
+   }, func(argsJSON string) (string, error) {
+       // tool logic
+       return "result", nil
+   })
+   ```
+2. **Adding Capability Tags**:
+   Tag worker nodes with arbitrary capability identifiers using `GOAGENT_CAPABILITIES=gpu,vision,storage,logs`. When the leader delegates a task requiring a capability (e.g. `capability: "gpu"`), GoMesh automatically routes it to workers matching that tag.
+3. **Transport Adapters (Interface)**:
+   GoMesh leader and worker decouple transport via stdlib HTTP interfaces. Future transport adapters (e.g. WebSocket duplex streaming, mTLS, libp2p, or Unix sockets) can be plugged in by wrapping `net.Listener` on the server and `http.RoundTripper` on the client.
 4. **TODO: Deck / Slide Presentation Generator**:
    The `generate_pdf` tool provides pure-Go document rendering. A standalone slide deck generator (PPTX) can be added as an extension point using standard OOXML zip generation.
 
