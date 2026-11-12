@@ -1,6 +1,7 @@
 package mesh
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -9,14 +10,17 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	MaxPendingTasks   = 1000
-	MaxActiveMissions = 100
+	MaxPendingTasks        = 1000
+	MaxActiveMissions      = 100
+	CompactThresholdBytes  = 8 * 1024 * 1024 // 8 MB
+	CompactCheckEventCount = 1000
 )
 
 // SubtaskInput represents a requested subtask for a mission.
@@ -35,6 +39,7 @@ type QueueEvent struct {
 	WorkerID  string        `json:"worker_id,omitempty"`
 	Report    *ReportReq    `json:"report,omitempty"`
 	Attempts  int           `json:"attempts,omitempty"`
+	Snapshot  *SnapshotData `json:"snapshot,omitempty"`
 }
 
 type waiter struct {
@@ -60,6 +65,7 @@ type Queue struct {
 	taskTimeout        time.Duration
 	missionTimeout     time.Duration
 	maxSubtaskAttempts int
+	eventsSinceCheck   int
 }
 
 // NewQueue creates and initializes a Queue with optional state replay and retry limits.
@@ -183,6 +189,129 @@ func (q *Queue) Stats() (pending int, inFlight int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.pendingTasks), len(q.inFlightTasks)
+}
+
+// ClusterStats returns point-in-time statistics for all workers and cluster queue depth.
+func (q *Queue) ClusterStats() (workers []WorkerStats, pending, inFlight, activeMissions int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	workers = make([]WorkerStats, 0, len(q.workers))
+	for _, w := range q.workers {
+		ws := WorkerStats{
+			ID:           w.ID,
+			Capabilities: append([]string{}, w.Capabilities...),
+			LastSeen:     w.LastSeen,
+			InFlight:     w.InFlight,
+			Completed:    w.Completed,
+			Failed:       w.Failed,
+			Requeued:     w.Requeued,
+			Status:       w.Status,
+		}
+		workers = append(workers, ws)
+	}
+
+	pending = len(q.pendingTasks)
+	inFlight = len(q.inFlightTasks)
+	for _, m := range q.missions {
+		if m.Status == "pending" || m.Status == "in_progress" {
+			activeMissions++
+		}
+	}
+	return workers, pending, inFlight, activeMissions
+}
+
+// ListMissions returns a snapshot copy of recent missions matching optional status filter.
+func (q *Queue) ListMissions(status string, limit int) []MissionSummary {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if limit <= 0 {
+		limit = 20
+	} else if limit > 100 {
+		limit = 100
+	}
+
+	filtered := make([]*MissionState, 0, len(q.missions))
+	for _, m := range q.missions {
+		if status == "" || m.Status == status {
+			filtered = append(filtered, m)
+		}
+	}
+
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].CreatedAt.After(filtered[j].CreatedAt)
+	})
+
+	if len(filtered) > limit {
+		filtered = filtered[:limit]
+	}
+
+	out := make([]MissionSummary, 0, len(filtered))
+	for _, m := range filtered {
+		var counts SubtaskCounts
+		counts.Total = len(m.Subtasks)
+		for _, st := range m.Subtasks {
+			switch st.Status {
+			case "pending":
+				counts.Pending++
+			case "in_flight":
+				counts.InFlight++
+			case "completed":
+				counts.Completed++
+			case "failed":
+				counts.Failed++
+			case "cancelled":
+				counts.Cancelled++
+			}
+		}
+		out = append(out, MissionSummary{
+			ID:            m.ID,
+			Text:          m.Text,
+			Status:        m.Status,
+			CreatedAt:     m.CreatedAt,
+			CompletedAt:   m.CompletedAt,
+			Subtasks:      counts,
+			SubtaskCounts: counts,
+		})
+	}
+	return out
+}
+
+// ListTasks returns snapshots of all subtasks for a specific mission.
+func (q *Queue) ListTasks(missionID string) ([]TaskSummary, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	m, ok := q.missions[missionID]
+	if !ok {
+		return nil, fmt.Errorf("mission %s not found", missionID)
+	}
+
+	out := make([]TaskSummary, 0, len(m.Subtasks))
+	for _, st := range m.Subtasks {
+		assignedAt := st.AssignedAt
+		if assignedAt.IsZero() {
+			if t, ok := q.tasks[st.ID]; ok {
+				assignedAt = t.AssignedAt
+			}
+		}
+		res := st.Result
+		if r := []rune(res); len(r) > 200 {
+			res = string(r[:200])
+		}
+		out = append(out, TaskSummary{
+			ID:         st.ID,
+			Goal:       st.Goal,
+			Status:     st.Status,
+			AssignedTo: st.AssignedTo,
+			Attempts:   st.Attempts,
+			AssignedAt: assignedAt,
+			Result:     res,
+			Error:      st.Error,
+		})
+	}
+	return out, nil
 }
 
 // AddMission enqueues a new mission with its subtasks.
@@ -361,6 +490,7 @@ func (q *Queue) assignTaskLocked(task *Task, workerID string) {
 				task.Attempts = m.Subtasks[i].Attempts
 				m.Subtasks[i].Status = "in_flight"
 				m.Subtasks[i].AssignedTo = workerID
+				m.Subtasks[i].AssignedAt = now
 				break
 			}
 		}
@@ -424,6 +554,7 @@ func (q *Queue) RequeueOnDispatchFailure(taskID string) {
 	}
 	if w, ok := q.workers[task.AssignedTo]; ok {
 		w.InFlight = len(q.workerInFlight[task.AssignedTo])
+		w.Requeued++
 	}
 	task.AssignedTo = ""
 	task.AssignedAt = time.Time{}
@@ -526,6 +657,17 @@ func (q *Queue) ReportTask(req ReportReq) error {
 		}
 
 		q.checkMissionCompletionLocked(m, now)
+	}
+
+	if w, ok := q.workers[req.WorkerID]; ok {
+		if req.Success {
+			w.Completed++
+		} else {
+			w.Failed++
+			if requeued {
+				w.Requeued++
+			}
+		}
 	}
 
 	q.appendEvent(QueueEvent{
@@ -825,6 +967,9 @@ func (q *Queue) SweepTaskTimeouts() int {
 					m.Subtasks[subtaskIdx].Status = "pending"
 					m.Subtasks[subtaskIdx].AssignedTo = ""
 				}
+				if w, ok := q.workers[workerID]; ok {
+					w.Requeued++
+				}
 				q.appendEvent(QueueEvent{
 					Type:      "task_requeued",
 					Time:      now,
@@ -839,6 +984,9 @@ func (q *Queue) SweepTaskTimeouts() int {
 					m.Subtasks[subtaskIdx].Status = "failed"
 					m.Subtasks[subtaskIdx].Error = fmt.Sprintf("task timed out after %ds", int(q.taskTimeout.Seconds()))
 					m.Subtasks[subtaskIdx].CompletedAt = now
+				}
+				if w, ok := q.workers[workerID]; ok {
+					w.Failed++
 				}
 				log.Printf("[mesh] task %s timed out on %s, marked failed (attempts exhausted %d/%d)", taskID, workerID, attempts, q.maxSubtaskAttempts)
 
@@ -882,6 +1030,7 @@ func (q *Queue) SweepDeadWorkers(deadTimeout time.Duration) int {
 					delete(inflight, taskID)
 
 					q.recordAbortLocked(id, taskID)
+					w.Requeued++
 
 					task.AssignedTo = ""
 					task.AssignedAt = time.Time{}
@@ -968,16 +1117,165 @@ func (q *Queue) appendEvent(ev QueueEvent) {
 	}
 	defer f.Close()
 	_, _ = f.Write(append(data, '\n'))
+
+	q.eventsSinceCheck++
+	if q.eventsSinceCheck >= CompactCheckEventCount {
+		q.eventsSinceCheck = 0
+		_ = q.maybeCompactLocked()
+	}
+}
+
+func (q *Queue) maybeCompactLocked() error {
+	if q.stateFile == "" {
+		return nil
+	}
+	fi, err := os.Stat(q.stateFile)
+	if err != nil {
+		return nil
+	}
+	if fi.Size() > CompactThresholdBytes {
+		return q.compactLocked()
+	}
+	return nil
+}
+
+// CompactNow forces an immediate log compaction (useful in tests and manual maintenance).
+func (q *Queue) CompactNow() error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.compactLocked()
+}
+
+// MaybeCompact checks file size and triggers compaction if exceeding threshold.
+func (q *Queue) MaybeCompact() error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.maybeCompactLocked()
+}
+
+func (q *Queue) compactLocked() error {
+	if q.stateFile == "" {
+		return nil
+	}
+
+	// 1. Gather active missions
+	var activeMissions []*MissionState
+	for _, m := range q.missions {
+		if m.Status == "pending" || m.Status == "in_progress" {
+			mCopy := *m
+			mCopy.Subtasks = append([]SubtaskState{}, m.Subtasks...)
+			activeMissions = append(activeMissions, &mCopy)
+		}
+	}
+
+	// 2. Gather completed missions (up to 100 most recent with FinalResult)
+	var completedMissions []*MissionState
+	for _, m := range q.missions {
+		if m.Status == "completed" {
+			mCopy := *m
+			mCopy.Subtasks = append([]SubtaskState{}, m.Subtasks...)
+			completedMissions = append(completedMissions, &mCopy)
+		}
+	}
+	sort.Slice(completedMissions, func(i, j int) bool {
+		return completedMissions[i].CompletedAt.After(completedMissions[j].CompletedAt)
+	})
+	if len(completedMissions) > 100 {
+		completedMissions = completedMissions[:100]
+	}
+
+	allMissions := append(activeMissions, completedMissions...)
+
+	// 3. Gather tasks pending and in-flight
+	snapPending := make([]*Task, 0, len(q.pendingTasks))
+	for _, t := range q.pendingTasks {
+		tCopy := *t
+		snapPending = append(snapPending, &tCopy)
+	}
+
+	snapInFlight := make([]*Task, 0, len(q.inFlightTasks))
+	for _, t := range q.inFlightTasks {
+		tCopy := *t
+		snapInFlight = append(snapInFlight, &tCopy)
+	}
+
+	// 4. Gather worker table
+	snapWorkers := make([]*WorkerInfo, 0, len(q.workers))
+	for _, w := range q.workers {
+		wCopy := *w
+		wCopy.Capabilities = append([]string{}, w.Capabilities...)
+		snapWorkers = append(snapWorkers, &wCopy)
+	}
+
+	snapEv := QueueEvent{
+		Type: "snapshot",
+		Time: time.Now(),
+		Snapshot: &SnapshotData{
+			Missions:      allMissions,
+			PendingTasks:  snapPending,
+			InFlightTasks: snapInFlight,
+			Workers:       snapWorkers,
+		},
+	}
+
+	data, err := json.Marshal(snapEv)
+	if err != nil {
+		return fmt.Errorf("failed to marshal snapshot: %w", err)
+	}
+
+	compactFile := q.stateFile + ".compact"
+	f, err := os.OpenFile(compactFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("failed to open compact file: %w", err)
+	}
+
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		_ = f.Close()
+		_ = os.Remove(compactFile)
+		return fmt.Errorf("failed to write compact file: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(compactFile)
+		return fmt.Errorf("failed to sync compact file: %w", err)
+	}
+
+	if err := f.Close(); err != nil {
+		_ = os.Remove(compactFile)
+		return fmt.Errorf("failed to close compact file: %w", err)
+	}
+
+	if err := os.Rename(compactFile, q.stateFile); err != nil {
+		return fmt.Errorf("failed to atomic rename compact file: %w", err)
+	}
+
+	if dirF, err := os.Open(filepath.Dir(q.stateFile)); err == nil {
+		_ = dirF.Sync()
+		_ = dirF.Close()
+	}
+
+	q.eventsSinceCheck = 0
+	log.Printf("[mesh] state compacted: snapshot written to %s (%d bytes)", q.stateFile, len(data))
+	return nil
 }
 
 func (q *Queue) replay() {
-	data, err := os.ReadFile(q.stateFile)
-	if err != nil {
+	if q.stateFile == "" {
 		return
 	}
 
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
+	f, err := os.Open(q.stateFile)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
@@ -987,6 +1285,57 @@ func (q *Queue) replay() {
 		}
 
 		switch ev.Type {
+		case "snapshot":
+			if ev.Snapshot != nil {
+				q.missions = make(map[string]*MissionState)
+				q.tasks = make(map[string]*Task)
+				q.pendingTasks = make([]*Task, 0)
+				q.inFlightTasks = make(map[string]*Task)
+				q.workerInFlight = make(map[string]map[string]bool)
+				q.workers = make(map[string]*WorkerInfo)
+
+				for _, w := range ev.Snapshot.Workers {
+					wCopy := *w
+					wCopy.Capabilities = append([]string{}, w.Capabilities...)
+					q.workers[w.ID] = &wCopy
+					q.workerInFlight[w.ID] = make(map[string]bool)
+				}
+				for _, m := range ev.Snapshot.Missions {
+					mCopy := *m
+					mCopy.Subtasks = append([]SubtaskState{}, m.Subtasks...)
+					q.missions[m.ID] = &mCopy
+					for _, st := range mCopy.Subtasks {
+						t := &Task{
+							ID:         st.ID,
+							MissionID:  mCopy.ID,
+							Goal:       st.Goal,
+							Context:    st.Context,
+							Capability: st.Capability,
+							CreatedAt:  st.CreatedAt,
+							AssignedTo: st.AssignedTo,
+							AssignedAt: st.AssignedAt,
+							Attempts:   st.Attempts,
+						}
+						q.tasks[t.ID] = t
+					}
+				}
+				for _, pt := range ev.Snapshot.PendingTasks {
+					tCopy := *pt
+					q.tasks[tCopy.ID] = &tCopy
+					q.pendingTasks = append(q.pendingTasks, &tCopy)
+				}
+				for _, ift := range ev.Snapshot.InFlightTasks {
+					tCopy := *ift
+					q.tasks[tCopy.ID] = &tCopy
+					q.inFlightTasks[tCopy.ID] = &tCopy
+					if tCopy.AssignedTo != "" {
+						if q.workerInFlight[tCopy.AssignedTo] == nil {
+							q.workerInFlight[tCopy.AssignedTo] = make(map[string]bool)
+						}
+						q.workerInFlight[tCopy.AssignedTo][tCopy.ID] = true
+					}
+				}
+			}
 		case "mission_added":
 			if ev.Mission != nil {
 				q.missions[ev.Mission.ID] = ev.Mission
@@ -1027,6 +1376,7 @@ func (q *Queue) replay() {
 							t.Attempts = m.Subtasks[i].Attempts
 							m.Subtasks[i].Status = "in_flight"
 							m.Subtasks[i].AssignedTo = ev.WorkerID
+							m.Subtasks[i].AssignedAt = ev.Time
 							break
 						}
 					}

@@ -23,6 +23,7 @@ type Server struct {
 	listener   net.Listener
 	mu         sync.Mutex
 	stopChan   chan struct{}
+	startTime  time.Time
 }
 
 // NewServer initializes a GoMesh HTTP/1.1 leader server.
@@ -32,6 +33,7 @@ func NewServer(listenAddr, token string, queue *Queue) *Server {
 		token:      token,
 		queue:      queue,
 		stopChan:   make(chan struct{}),
+		startTime:  time.Now(),
 	}
 }
 
@@ -51,6 +53,7 @@ func (s *Server) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/rpc", s.handleRPC)
 	mux.HandleFunc("/nexttask", s.handleNextTask)
+	mux.HandleFunc("/statusz", s.handleStatusz)
 
 	handler := s.authMiddleware(mux)
 	s.server = &http.Server{
@@ -227,6 +230,35 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		}
 		writeRPCSuccess(w, req.ID, ReportResp{OK: true})
 
+	case "mesh.list_missions":
+		var p struct {
+			Status string `json:"status"`
+			Limit  int    `json:"limit"`
+		}
+		if len(req.Params) > 0 && string(req.Params) != "null" {
+			if err := json.Unmarshal(req.Params, &p); err != nil {
+				writeRPCError(w, req.ID, -32602, "invalid params for mesh.list_missions")
+				return
+			}
+		}
+		missions := s.queue.ListMissions(p.Status, p.Limit)
+		writeRPCSuccess(w, req.ID, missions)
+
+	case "mesh.list_tasks":
+		var p struct {
+			MissionID string `json:"mission_id"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil || strings.TrimSpace(p.MissionID) == "" {
+			writeRPCError(w, req.ID, -32602, "invalid params for mesh.list_tasks")
+			return
+		}
+		tasks, err := s.queue.ListTasks(p.MissionID)
+		if err != nil {
+			writeRPCError(w, req.ID, -32000, err.Error())
+			return
+		}
+		writeRPCSuccess(w, req.ID, tasks)
+
 	default:
 		writeRPCError(w, req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
 	}
@@ -262,6 +294,49 @@ func (s *Server) handleNextTask(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleStatusz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	workers, pending, inFlight, activeMissions := s.queue.ClusterStats()
+
+	alive := 0
+	dead := 0
+	for _, w := range workers {
+		if w.Status == "dead" {
+			dead++
+		} else {
+			alive++
+		}
+	}
+
+	uptimeSec := int64(time.Since(s.startTime).Seconds())
+
+	resp := map[string]any{
+		"protocol":   MeshProtocol,
+		"role":       "leader",
+		"uptime_sec": uptimeSec,
+		"workers": map[string]int{
+			"total": len(workers),
+			"alive": alive,
+			"dead":  dead,
+		},
+		"queue": map[string]int{
+			"pending":         pending,
+			"in_flight":       inFlight,
+			"active_missions": activeMissions,
+		},
+		"workers_detail": workers,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(HeaderMeshProto, ProtoVersion)
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
 func (s *Server) sweeperLoop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -274,6 +349,7 @@ func (s *Server) sweeperLoop() {
 			s.queue.SweepTaskTimeouts()
 			s.queue.SweepDeadWorkers(DeadTimeoutSec * time.Second)
 			s.queue.SweepMissionTimeouts()
+			_ = s.queue.MaybeCompact()
 		}
 	}
 }

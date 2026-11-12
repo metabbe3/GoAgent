@@ -394,3 +394,44 @@ func TestLoopToolContextTimeout(t *testing.T) {
 		t.Fatalf("loop should complete in < 3s when ctx times out, took %v", elapsed)
 	}
 }
+
+func TestLogContextCorrelation(t *testing.T) {
+	// 1. Empty context
+	taskID, missionID := FromContext(context.Background())
+	if taskID != "" || missionID != "" {
+		t.Errorf("expected empty taskID and missionID, got: %q, %q", taskID, missionID)
+	}
+	if p := LogPrefix(context.Background()); p != "" {
+		t.Errorf("expected empty log prefix, got: %q", p)
+	}
+
+	// 2. Context with task_id only
+	ctx := context.WithValue(context.Background(), TaskIDKey, "task-999")
+	taskID, missionID = FromContext(ctx)
+	if taskID != "task-999" || missionID != "" {
+		t.Errorf("expected task-999 and empty missionID, got: %q, %q", taskID, missionID)
+	}
+	if p := LogPrefix(ctx); p != "[task task-999] " {
+		t.Errorf("unexpected prefix: %q", p)
+	}
+
+	// 3. Context with both task_id and mission_id
+	ctx = context.WithValue(ctx, MissionIDKey, "mission-111")
+	taskID, missionID = FromContext(ctx)
+	if taskID != "task-999" || missionID != "mission-111" {
+		t.Errorf("expected task-999 and mission-111, got: %q, %q", taskID, missionID)
+	}
+	if p := LogPrefix(ctx); p != "[task task-999] " {
+		t.Errorf("unexpected prefix: %q", p)
+	}
+
+	// 4. Context with mission_id only
+	ctxMissionOnly := context.WithValue(context.Background(), MissionIDKey, "mission-222")
+	taskID, missionID = FromContext(ctxMissionOnly)
+	if taskID != "" || missionID != "mission-222" {
+		t.Errorf("expected empty taskID and mission-222, got: %q, %q", taskID, missionID)
+	}
+	if p := LogPrefix(ctxMissionOnly); p != "[mission mission-222] " {
+		t.Errorf("unexpected prefix: %q", p)
+	}
+}

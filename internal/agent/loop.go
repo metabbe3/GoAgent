@@ -20,6 +20,39 @@ const (
 	MaxConcurrentTools = 4
 )
 
+type ctxKey string
+
+const (
+	TaskIDKey    ctxKey = "task_id"
+	MissionIDKey ctxKey = "mission_id"
+)
+
+// FromContext extracts task_id and mission_id from context.
+func FromContext(ctx context.Context) (taskID, missionID string) {
+	if ctx == nil {
+		return "", ""
+	}
+	if v, ok := ctx.Value(TaskIDKey).(string); ok {
+		taskID = v
+	}
+	if v, ok := ctx.Value(MissionIDKey).(string); ok {
+		missionID = v
+	}
+	return taskID, missionID
+}
+
+// LogPrefix returns a prefix string like "[task <id>] " if task_id or mission_id is in ctx.
+func LogPrefix(ctx context.Context) string {
+	taskID, missionID := FromContext(ctx)
+	if taskID != "" {
+		return fmt.Sprintf("[task %s] ", taskID)
+	}
+	if missionID != "" {
+		return fmt.Sprintf("[mission %s] ", missionID)
+	}
+	return ""
+}
+
 // Loop manages the iterative conversation cycle between user, LLM, and tools.
 type Loop struct {
 	llmClient     *llm.Client
@@ -75,7 +108,7 @@ func (l *Loop) runWithEscalation(ctx context.Context, userText string, history [
 		return reply, msgs, err
 	}
 
-	log.Printf("[agent] escalating to heavy model %q after primary run: %v", l.llmClient.HeavyModel(), err)
+	log.Printf("[agent] %sescalating to heavy model %q after primary run: %v", LogPrefix(ctx), l.llmClient.HeavyModel(), err)
 	// Escalation retry: shallow copy with half the iteration budget, no mutation of shared state
 	retry := *l
 	retry.maxIterations = max(l.maxIterations/2, 2)
@@ -111,6 +144,7 @@ func (l *Loop) run(ctx context.Context, userText string, history []llm.ChatMessa
 
 	for iter := 0; iter < l.maxIterations; iter++ {
 		PruneContextBudget(messages, MaxContextChars)
+		log.Printf("[agent] %siteration %d/%d", LogPrefix(ctx), iter+1, l.maxIterations)
 
 		var assistantMsg *llm.ChatMessage
 		var err error
@@ -122,6 +156,7 @@ func (l *Loop) run(ctx context.Context, userText string, history []llm.ChatMessa
 		}
 
 		if err != nil {
+			log.Printf("[agent] %sllm error on iteration %d: %v", LogPrefix(ctx), iter+1, err)
 			return "", messages, fmt.Errorf("agent llm error: %w", err)
 		}
 
@@ -147,7 +182,7 @@ func (l *Loop) run(ctx context.Context, userText string, history []llm.ChatMessa
 				// Per-goroutine panic recovery prevents child panic from crashing the process
 				defer func() {
 					if r := recover(); r != nil {
-						log.Printf("[agent] PANIC in tool %s: %v\n%s", call.Function.Name, r, debug.Stack())
+						log.Printf("[agent] %sPANIC in tool %s: %v\n%s", LogPrefix(ctx), call.Function.Name, r, debug.Stack())
 						resultsMu.Lock()
 						results[idx] = toolResult{
 							index:      idx,
@@ -162,7 +197,7 @@ func (l *Loop) run(ctx context.Context, userText string, history []llm.ChatMessa
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
-				log.Printf("[agent] executing tool %s (id: %s) [worker]", call.Function.Name, call.ID)
+				log.Printf("[agent] %sexecuting tool %s (id: %s) [worker]", LogPrefix(ctx), call.Function.Name, call.ID)
 				output, err := l.registry.Execute(ctx, call.Function.Name, call.Function.Arguments)
 				if err != nil {
 					output = fmt.Sprintf("Error executing tool: %v", err)

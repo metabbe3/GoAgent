@@ -1,11 +1,14 @@
 package mesh
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1353,5 +1356,523 @@ func TestQueueLimitsAndResultSize(t *testing.T) {
 	err = q.SetMissionResult(st.ID, hugeResult)
 	if err == nil || !strings.Contains(err.Error(), "result too large") {
 		t.Fatalf("expected 'result too large' error, got %v", err)
+	}
+}
+
+// G-T1: /statusz endpoint authentication, JSON structure, and worker/queue statistics.
+func TestStatuszEndpoint(t *testing.T) {
+	token := "statusz-token-123"
+	q := NewQueue("", 10*time.Second, 60*time.Second)
+	srv := NewServer("127.0.0.1:0", token, q)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer srv.Stop(context.Background())
+
+	// 1. Unauthorized checks
+	client := &http.Client{Timeout: 3 * time.Second}
+	statuszURL := "http://" + srv.Addr() + "/statusz"
+
+	reqNoToken, _ := http.NewRequest(http.MethodGet, statuszURL, nil)
+	resp, err := client.Do(reqNoToken)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without token, got %d", resp.StatusCode)
+	}
+
+	reqWrongToken, _ := http.NewRequest(http.MethodGet, statuszURL, nil)
+	reqWrongToken.Header.Set(HeaderMeshToken, "bad-token")
+	resp, err = client.Do(reqWrongToken)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with wrong token, got %d", resp.StatusCode)
+	}
+
+	// 2. Populate workers and queue
+	w1 := q.RegisterWorker("w1", []string{"shell", "logs"})
+	w2 := q.RegisterWorker("w2", []string{"shell"})
+	q.mu.Lock()
+	w2.Status = "dead"
+	q.mu.Unlock()
+
+	mission, err := q.AddMission("Test mission", []SubtaskInput{
+		{Goal: "subtask 1", Capability: "shell"},
+		{Goal: "subtask 2", Capability: "shell"},
+	})
+	if err != nil {
+		t.Fatalf("failed to add mission: %v", err)
+	}
+
+	// Assign one task to w1
+	q.mu.Lock()
+	t1 := q.pendingTasks[0]
+	q.pendingTasks = q.pendingTasks[1:]
+	q.assignTaskLocked(t1, w1.ID)
+	q.mu.Unlock()
+
+	// 3. Authorized /statusz call
+	reqAuth, _ := http.NewRequest(http.MethodGet, statuszURL, nil)
+	reqAuth.Header.Set(HeaderMeshToken, token)
+	resp, err = client.Do(reqAuth)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	var data struct {
+		Protocol  string `json:"protocol"`
+		Role      string `json:"role"`
+		UptimeSec int64  `json:"uptime_sec"`
+		Workers   struct {
+			Total int `json:"total"`
+			Alive int `json:"alive"`
+			Dead  int `json:"dead"`
+		} `json:"workers"`
+		Queue struct {
+			Pending        int `json:"pending"`
+			InFlight       int `json:"in_flight"`
+			ActiveMissions int `json:"active_missions"`
+		} `json:"queue"`
+		WorkersDetail []WorkerStats `json:"workers_detail"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		t.Fatalf("failed to decode statusz response: %v", err)
+	}
+
+	if data.Protocol != "GoMesh/1.1" {
+		t.Errorf("expected protocol GoMesh/1.1, got %q", data.Protocol)
+	}
+	if data.Role != "leader" {
+		t.Errorf("expected role leader, got %q", data.Role)
+	}
+	if data.Workers.Total != 2 || data.Workers.Alive != 1 || data.Workers.Dead != 1 {
+		t.Errorf("unexpected workers counts: %+v", data.Workers)
+	}
+	if data.Queue.Pending != 1 || data.Queue.InFlight != 1 || data.Queue.ActiveMissions != 1 {
+		t.Errorf("unexpected queue counts: %+v", data.Queue)
+	}
+	if len(data.WorkersDetail) != 2 {
+		t.Fatalf("expected 2 workers detail, got %d", len(data.WorkersDetail))
+	}
+
+	foundW1 := false
+	for _, wd := range data.WorkersDetail {
+		if wd.ID == "w1" {
+			foundW1 = true
+			if wd.InFlight != 1 {
+				t.Errorf("expected w1 in_flight=1, got %d", wd.InFlight)
+			}
+			if wd.Status != "active" {
+				t.Errorf("expected w1 status active, got %s", wd.Status)
+			}
+		}
+	}
+	if !foundW1 {
+		t.Errorf("w1 not found in workers_detail")
+	}
+	_ = mission
+}
+
+// G-T1: Worker performance counters (Completed, Failed, Requeued).
+func TestWorkerCounters(t *testing.T) {
+	q := NewQueue("", 10*time.Second, 60*time.Second, 2)
+	w := q.RegisterWorker("w-perf", []string{"compute"})
+
+	// Scenario 1: ReportTask success -> Completed++
+	m1, err := q.AddMission("M1", []SubtaskInput{{Goal: "G1", Capability: "compute"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.mu.Lock()
+	t1 := q.pendingTasks[0]
+	q.pendingTasks = q.pendingTasks[1:]
+	q.assignTaskLocked(t1, w.ID)
+	q.mu.Unlock()
+
+	err = q.ReportTask(ReportReq{
+		WorkerID:  w.ID,
+		TaskID:    t1.ID,
+		MissionID: m1.ID,
+		Success:   true,
+		Result:    "OK",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Completed != 1 || w.Failed != 0 || w.Requeued != 0 {
+		t.Fatalf("after success: expected completed=1 failed=0 requeued=0, got c=%d f=%d r=%d", w.Completed, w.Failed, w.Requeued)
+	}
+
+	// Scenario 2: ReportTask failure (attempts < maxAttempts) -> Failed++, Requeued++
+	m2, err := q.AddMission("M2", []SubtaskInput{{Goal: "G2", Capability: "compute"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.mu.Lock()
+	t2 := q.pendingTasks[0]
+	q.pendingTasks = q.pendingTasks[1:]
+	q.assignTaskLocked(t2, w.ID)
+	q.mu.Unlock()
+
+	err = q.ReportTask(ReportReq{
+		WorkerID:  w.ID,
+		TaskID:    t2.ID,
+		MissionID: m2.ID,
+		Success:   false,
+		Error:     "transient error",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Completed != 1 || w.Failed != 1 || w.Requeued != 1 {
+		t.Fatalf("after retryable failure: expected c=1 f=1 r=1, got c=%d f=%d r=%d", w.Completed, w.Failed, w.Requeued)
+	}
+
+	// Scenario 3: ReportTask failure again (attempts exhausted) -> Failed++
+	q.mu.Lock()
+	t2Retry := q.pendingTasks[0]
+	q.pendingTasks = q.pendingTasks[1:]
+	q.assignTaskLocked(t2Retry, w.ID)
+	q.mu.Unlock()
+
+	err = q.ReportTask(ReportReq{
+		WorkerID:  w.ID,
+		TaskID:    t2Retry.ID,
+		MissionID: m2.ID,
+		Success:   false,
+		Error:     "permanent error",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Completed != 1 || w.Failed != 2 || w.Requeued != 1 {
+		t.Fatalf("after non-retryable failure: expected c=1 f=2 r=1, got c=%d f=%d r=%d", w.Completed, w.Failed, w.Requeued)
+	}
+
+	// Scenario 4: RequeueOnDispatchFailure -> Requeued++
+	m3, _ := q.AddMission("M3", []SubtaskInput{{Goal: "G3", Capability: "compute"}})
+	q.mu.Lock()
+	t3 := q.pendingTasks[0]
+	q.pendingTasks = q.pendingTasks[1:]
+	q.assignTaskLocked(t3, w.ID)
+	q.mu.Unlock()
+
+	q.RequeueOnDispatchFailure(t3.ID)
+	if w.Requeued != 2 {
+		t.Fatalf("after dispatch failure requeue: expected r=2, got %d", w.Requeued)
+	}
+	_ = m3
+
+	// Verify ClusterStats reflects these counters
+	stats, _, _, _ := q.ClusterStats()
+	if len(stats) != 1 || stats[0].Completed != 1 || stats[0].Failed != 2 || stats[0].Requeued != 2 {
+		t.Fatalf("ClusterStats returned unexpected stats: %+v", stats)
+	}
+}
+
+// G-T1: RPC methods mesh.list_missions and mesh.list_tasks.
+func TestRPCListMissionsAndListTasks(t *testing.T) {
+	token := "rpc-query-token"
+	q := NewQueue("", 10*time.Second, 60*time.Second)
+	srv := NewServer("127.0.0.1:0", token, q)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer srv.Stop(context.Background())
+
+	rpcURL := "http://" + srv.Addr() + "/rpc"
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	callRPC := func(method string, params any) (*RPCResponse, error) {
+		pJSON, _ := json.Marshal(params)
+		reqBody, _ := json.Marshal(RPCRequest{
+			JSONRPC: "2.0",
+			ID:      1,
+			Method:  method,
+			Params:  pJSON,
+		})
+		httpReq, _ := http.NewRequest(http.MethodPost, rpcURL, bytes.NewReader(reqBody))
+		httpReq.Header.Set(HeaderMeshToken, token)
+		httpReq.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		var rpcResp RPCResponse
+		if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+			return nil, err
+		}
+		return &rpcResp, nil
+	}
+
+	// Create mission 1 with long result
+	w := q.RegisterWorker("w-rpc", []string{"general"})
+	m1, err := q.AddMission("Analyze traffic patterns", []SubtaskInput{
+		{Goal: "Check ingress"},
+		{Goal: "Check egress"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	longResult := strings.Repeat("Detailed metrics analysis log line. ", 10) // ~360 chars
+	q.mu.Lock()
+	t1 := q.pendingTasks[0]
+	t2 := q.pendingTasks[1]
+	q.pendingTasks = q.pendingTasks[2:]
+	q.assignTaskLocked(t1, w.ID)
+	q.assignTaskLocked(t2, w.ID)
+	q.mu.Unlock()
+
+	_ = q.ReportTask(ReportReq{WorkerID: w.ID, TaskID: t1.ID, MissionID: m1.ID, Success: true, Result: longResult})
+	_ = q.ReportTask(ReportReq{WorkerID: w.ID, TaskID: t2.ID, MissionID: m1.ID, Success: true, Result: "Egress clean"})
+
+	// Create mission 2 (pending)
+	m2, _ := q.AddMission("Database audit", []SubtaskInput{{Goal: "Verify indices"}})
+	_ = m2
+
+	// 1. Test mesh.list_missions without filter
+	resp, err := callRPC("mesh.list_missions", nil)
+	if err != nil || resp.Error != nil {
+		t.Fatalf("mesh.list_missions failed: %v, error: %+v", err, resp.Error)
+	}
+	var missions []MissionSummary
+	resBytes, _ := json.Marshal(resp.Result)
+	if err := json.Unmarshal(resBytes, &missions); err != nil {
+		t.Fatalf("failed to unmarshal missions: %v", err)
+	}
+	if len(missions) != 2 {
+		t.Fatalf("expected 2 missions, got %d", len(missions))
+	}
+
+	// 2. Test mesh.list_missions with status filter "completed"
+	resp, err = callRPC("mesh.list_missions", map[string]any{"status": "completed"})
+	if err != nil || resp.Error != nil {
+		t.Fatalf("filtered list_missions failed: %v", err)
+	}
+	resBytes, _ = json.Marshal(resp.Result)
+	var completedMissions []MissionSummary
+	_ = json.Unmarshal(resBytes, &completedMissions)
+	if len(completedMissions) != 1 || completedMissions[0].ID != m1.ID {
+		t.Fatalf("expected 1 completed mission %s, got: %+v", m1.ID, completedMissions)
+	}
+	if completedMissions[0].Subtasks.Completed != 2 || completedMissions[0].SubtaskCounts.Total != 2 {
+		t.Fatalf("unexpected subtask counts: %+v", completedMissions[0].Subtasks)
+	}
+
+	// 3. Test mesh.list_tasks for mission 1
+	resp, err = callRPC("mesh.list_tasks", map[string]any{"mission_id": m1.ID})
+	if err != nil || resp.Error != nil {
+		t.Fatalf("list_tasks failed: %v, error: %+v", err, resp.Error)
+	}
+	resBytes, _ = json.Marshal(resp.Result)
+	var tasks []TaskSummary
+	if err := json.Unmarshal(resBytes, &tasks); err != nil {
+		t.Fatalf("failed to unmarshal tasks: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("expected 2 subtasks, got %d", len(tasks))
+	}
+
+	// Check truncation to 200 chars
+	if len([]rune(tasks[0].Result)) > 200 {
+		t.Fatalf("expected result truncated to <= 200 chars, got %d", len([]rune(tasks[0].Result)))
+	}
+	if tasks[0].AssignedTo != w.ID {
+		t.Errorf("expected assigned_to=%s, got %s", w.ID, tasks[0].AssignedTo)
+	}
+	if tasks[0].AssignedAt.IsZero() {
+		t.Errorf("expected non-zero AssignedAt timestamp")
+	}
+
+	// 4. Test mesh.list_tasks invalid params
+	resp, err = callRPC("mesh.list_tasks", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error == nil || resp.Error.Code != -32602 {
+		t.Fatalf("expected error code -32602, got: %+v", resp.Error)
+	}
+}
+
+// G-T2: Streaming replay and compaction.
+func TestStreamingReplayAndCompaction(t *testing.T) {
+	tmpDir := t.TempDir()
+	q := NewQueue(tmpDir, 10*time.Second, 60*time.Second)
+
+	w := q.RegisterWorker("w-compact", []string{"shell"})
+
+	// Add 5 missions
+	var mIDs []string
+	for i := 0; i < 5; i++ {
+		m, err := q.AddMission(fmt.Sprintf("Mission %d", i+1), []SubtaskInput{
+			{Goal: fmt.Sprintf("Goal A for mission %d", i+1)},
+			{Goal: fmt.Sprintf("Goal B for mission %d", i+1)},
+		})
+		if err != nil {
+			t.Fatalf("failed to add mission: %v", err)
+		}
+		mIDs = append(mIDs, m.ID)
+	}
+
+	// Complete 2 missions with results
+	for i := 0; i < 2; i++ {
+		mID := mIDs[i]
+		m, _ := q.MissionStatus(mID)
+		for _, st := range m.Subtasks {
+			q.mu.Lock()
+			for idx, pt := range q.pendingTasks {
+				if pt.ID == st.ID {
+					q.pendingTasks = append(q.pendingTasks[:idx], q.pendingTasks[idx+1:]...)
+					q.assignTaskLocked(pt, w.ID)
+					break
+				}
+			}
+			q.mu.Unlock()
+
+			_ = q.ReportTask(ReportReq{
+				WorkerID:  w.ID,
+				TaskID:    st.ID,
+				MissionID: mID,
+				Success:   true,
+				Result:    fmt.Sprintf("Completed %s successfully", st.ID),
+			})
+		}
+		_ = q.SetMissionResult(mID, fmt.Sprintf("Final synthesis for %s", mID))
+	}
+
+	stateFile := filepath.Join(tmpDir, "mesh", "state.jsonl")
+	fiBefore, err := os.Stat(stateFile)
+	if err != nil {
+		t.Fatalf("failed to stat state file: %v", err)
+	}
+	sizeBefore := fiBefore.Size()
+	if sizeBefore == 0 {
+		t.Fatalf("expected non-empty state file before compaction")
+	}
+
+	// Trigger compaction
+	if err := q.CompactNow(); err != nil {
+		t.Fatalf("CompactNow failed: %v", err)
+	}
+
+	// Compacted state file must exist and be smaller than event log
+	fiAfter, err := os.Stat(stateFile)
+	if err != nil {
+		t.Fatalf("failed to stat compacted state file: %v", err)
+	}
+	sizeAfter := fiAfter.Size()
+	if sizeAfter >= sizeBefore {
+		t.Fatalf("expected compacted size (%d) to be smaller than before (%d)", sizeAfter, sizeBefore)
+	}
+
+	// Read first line: must be snapshot
+	content, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("failed to read compacted file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected exactly 1 snapshot line in compacted file, got %d", len(lines))
+	}
+	var snapEv QueueEvent
+	if err := json.Unmarshal([]byte(lines[0]), &snapEv); err != nil {
+		t.Fatalf("failed to unmarshal snapshot event: %v", err)
+	}
+	if snapEv.Type != "snapshot" || snapEv.Snapshot == nil {
+		t.Fatalf("expected event type 'snapshot', got %q", snapEv.Type)
+	}
+
+	// Test streaming replay from compacted state
+	newQ := NewQueue(tmpDir, 10*time.Second, 60*time.Second)
+
+	// Verify restored missions
+	for _, id := range mIDs {
+		origM, err := q.MissionStatus(id)
+		if err != nil {
+			t.Fatalf("original mission not found: %s", id)
+		}
+		replayedM, err := newQ.MissionStatus(id)
+		if err != nil {
+			t.Fatalf("replayed mission not found: %s", id)
+		}
+		if replayedM.Status != origM.Status {
+			t.Errorf("mission %s status mismatch: original=%s, replayed=%s", id, origM.Status, replayedM.Status)
+		}
+		if replayedM.FinalResult != origM.FinalResult {
+			t.Errorf("mission %s final result mismatch: original=%q, replayed=%q", id, origM.FinalResult, replayedM.FinalResult)
+		}
+		if len(replayedM.Subtasks) != len(origM.Subtasks) {
+			t.Errorf("mission %s subtasks count mismatch: %d vs %d", id, len(origM.Subtasks), len(replayedM.Subtasks))
+		}
+	}
+
+	// Verify worker info restored
+	newWorkers := newQ.ListWorkers()
+	if len(newWorkers) != 1 || newWorkers[0].ID != "w-compact" {
+		t.Fatalf("expected restored worker w-compact, got %+v", newWorkers)
+	}
+}
+
+// G-T2: Verify streaming replay handles lines larger than standard bufio 64KB limit.
+func TestStreamingReplayLargeLine(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "mesh", "state.jsonl")
+	_ = os.MkdirAll(filepath.Dir(stateFile), 0o700)
+
+	// Create a mission with an 80KB result (> 64KB bufio.MaxScanTokenSize)
+	largeResult := strings.Repeat("x", 80*1024)
+	ev := QueueEvent{
+		Type:      "mission_result",
+		Time:      time.Now(),
+		MissionID: "m-large",
+		Report:    &ReportReq{Result: largeResult},
+	}
+	data, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) <= 64*1024 {
+		t.Fatalf("expected line size > 64KB, got %d", len(data))
+	}
+
+	// Write mission_added followed by mission_result
+	mEv := QueueEvent{
+		Type: "mission_added",
+		Time: time.Now(),
+		Mission: &MissionState{
+			ID:     "m-large",
+			Text:   "Large mission",
+			Status: "completed",
+		},
+	}
+	mData, _ := json.Marshal(mEv)
+	fileContent := append(mData, '\n')
+	fileContent = append(fileContent, append(data, '\n')...)
+
+	if err := os.WriteFile(stateFile, fileContent, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Replay should not fail on token too long
+	q := NewQueue(tmpDir, 10*time.Second, 60*time.Second)
+	st, err := q.MissionStatus("m-large")
+	if err != nil {
+		t.Fatalf("failed to retrieve replayed mission: %v", err)
+	}
+	if len(st.FinalResult) != len(largeResult) {
+		t.Fatalf("expected replayed final result length %d, got %d", len(largeResult), len(st.FinalResult))
 	}
 }

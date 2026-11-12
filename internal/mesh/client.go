@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metabbe3/GoAgent/internal/agent"
 	"github.com/metabbe3/GoAgent/internal/guardrail"
 )
 
@@ -292,6 +293,9 @@ func (c *Client) executeAndReportTask(ctx context.Context, task *Task) {
 
 	execCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
+
+	execCtx = context.WithValue(execCtx, agent.TaskIDKey, task.ID)
+	execCtx = context.WithValue(execCtx, agent.MissionIDKey, task.MissionID)
 
 	c.mu.Lock()
 	c.runningTasks[task.ID] = cancel

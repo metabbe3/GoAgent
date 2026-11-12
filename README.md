@@ -58,6 +58,11 @@ GOAGENT_ROLE=worker GOAGENT_LEADER_ADDR=http://127.0.0.1:7801 GOAGENT_MESH_TOKEN
   - `mesh.add_mission`: Enqueue a mission directly via JSON-RPC with 1..50 subtasks.
   - `mesh.report`: Worker reports subtask completion or failure with execution metrics. Outputs are automatically sanitized by guardrails before transmission.
   - `mesh.get_mission_result`: Returns a mission's persisted final answer (`final_result`) and status — the recovery path after a leader restart.
+  - `mesh.list_missions`: Query recent missions with optional `status` filter and `limit` (default 20, max 100); returns mission metadata and aggregate subtask counts by status.
+  - `mesh.list_tasks`: Query all subtasks for a specific mission (`mission_id`), returning goal, status, assigned worker, attempt count, assigned timestamp, and result truncated to 200 characters.
+- **Cluster Observability (`GET /statusz`)**:
+  - Protected by `X-Mesh-Token` (401 Unauthorized if missing/invalid).
+  - Returns cluster snapshot JSON: leader uptime in seconds, worker counts (`total`, `alive`, `dead`), queue depth (`pending`, `in_flight`, `active_missions`), and detailed per-worker statistics (`in_flight`, `completed`, `failed`, `requeued`, `status`, `last_seen`).
 - **Task Dequeue (`GET /nexttask?id=<worker_id>`)**:
   - Long-poll holding up to 50 seconds.
   - Returns HTTP 200 with task payload when matching task arrives.
