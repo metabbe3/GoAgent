@@ -111,6 +111,53 @@ Settings are loaded from `goagent.env` or system environment variables:
 | `GOAGENT_ALLOWED_ROOTS`| `.` | All | Colon-separated filesystem boundaries for file tools. |
 | `GOAGENT_ALLOW_ENV` | `false` | All | Permit reading `.env` files. |
 
+### Complete Environment Example
+
+Copy to `goagent.env` (or export inline). See `goagent.env.example` in the repo:
+
+```bash
+# ── LLM (required, all modes) ─────────────────────────────
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=sk-your-api-key
+LLM_MODEL=gpt-4o-mini
+# LLM_HEAVY_MODEL=gpt-4o                # escalation model (optional)
+# LLM_EMBED_URL=https://api.openai.com/v1/embeddings   # knowledge-base RAG (optional)
+# LLM_EMBED_MODEL=text-embedding-3-small
+
+# ── Telegram (solo mode, or dual-mode on leader/worker) ──
+TELEGRAM_TOKEN=123456789:ABC-DEF...
+GOAGENT_ADMIN_CHAT_ID=123456789
+
+# ── Mesh role: solo | leader | worker ────────────────────
+GOAGENT_ROLE=worker
+
+# ── Leader-only ──────────────────────────────────────────
+# GOAGENT_MESH_LISTEN=:7801                       # HTTP listen address
+# GOAGENT_MESH_TOKEN=change-me-shared-secret      # REQUIRED for leader
+# GOAGENT_TASK_TIMEOUT=300                        # per-subtask deadline (s)
+# GOAGENT_MISSION_TIMEOUT=1800                    # whole-mission deadline (s)
+# GOAGENT_SUBTASK_ATTEMPTS=2                      # retries per subtask
+
+# ── Worker-only ──────────────────────────────────────────
+GOAGENT_LEADER_ADDR=http://192.168.1.10:7801
+GOAGENT_MESH_TOKEN=change-me-shared-secret       # same token as leader
+GOAGENT_WORKER_ID=mac-mini-worker                # default: hostname-pid
+GOAGENT_CAPABILITIES=logs,files,shell            # capability tags for routing
+GOAGENT_FANOUT_MAX=3                             # parallel sub-agents on heavy tasks (0=off)
+
+# ── Guardrails (optional) ────────────────────────────────
+# GOAGENT_ALLOW_SHELL=false
+# GOAGENT_MAX_ITER=8
+# GOAGENT_MASK_IP=false
+# GOAGENT_ALLOWED_ROOTS=.:~/.goagent:/var/log
+# GOAGENT_ALLOW_ENV=false
+```
+
+Notes:
+- `data/mesh/state.jsonl` (leader) holds the event-sourced mesh state — back it up if missions matter; it is replayed on restart.
+- Workers may run behind NAT: they only make OUTBOUND connections (long-poll + heartbeat) to the leader.
+- Every env var above is optional except `LLM_*` (all modes) and `GOAGENT_MESH_TOKEN` (leader + worker modes).
+
 ---
 
 ## Built-in Tools
