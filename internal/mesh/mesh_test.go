@@ -83,26 +83,31 @@ func TestMeshAuthRejectWithoutToken(t *testing.T) {
 	}
 	defer srv.Stop(context.Background())
 
-	client := &http.Client{}
-	req, _ := http.NewRequest(http.MethodGet, "http://"+srv.Addr()+"/nexttask?id=w1", nil)
-
-	// No token -> 401
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("expected 401 Unauthorized without token, got %d", resp.StatusCode)
+	tests := []struct {
+		name       string
+		token      string
+		wantStatus int
+	}{
+		{"missing token", "", http.StatusUnauthorized},
+		{"wrong token", "wrong-secret", http.StatusUnauthorized},
 	}
 
-	// Wrong token -> 401
-	req.Header.Set(HeaderMeshToken, "wrong-token")
-	resp, err = client.Do(req)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("expected 401 Unauthorized with wrong token, got %d", resp.StatusCode)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &http.Client{}
+			req, _ := http.NewRequest(http.MethodGet, "http://"+srv.Addr()+"/nexttask?id=w1", nil)
+			if tt.token != "" {
+				req.Header.Set(HeaderMeshToken, tt.token)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("expected status %d, got %d", tt.wantStatus, resp.StatusCode)
+			}
+		})
 	}
 }
 

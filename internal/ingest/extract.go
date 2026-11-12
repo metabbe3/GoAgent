@@ -23,10 +23,10 @@ const MaxRowsPerSheet = 5_000
 var tagRe = regexp.MustCompile(`<[^>]*>`)
 var cjkRe = regexp.MustCompile(`[\p{Han}\p{Hangul}\p{Hiragana}\p{Katakana}]`)
 
-// collapseCellBreaks converts paragraph breaks inside a cell to a space.
+// collapseCellBreaks removes the trailing paragraph break before a cell end.
 func collapseCellBreaks(s string) string {
 	for strings.Contains(s, "\n\t") {
-		s = strings.ReplaceAll(s, "\n\t", " \t")
+		s = strings.ReplaceAll(s, "\n\t", "\t")
 	}
 	return s
 }

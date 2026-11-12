@@ -38,15 +38,15 @@ func TestExtractDocxTableCellsGetSeparators(t *testing.T) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	w, _ := zw.Create("word/document.xml")
-	w.Write([]byte("<w:document><w:body><w:tbl><w:tr><w:tc><w:p>Alpha</w:p></w:tc><w:tc><w:p>Beta</w:p></w:tc></w:tr></w:tbl></w:body></w:document>"))
+	w.Write([]byte("<w:document><w:body><w:tbl><w:tr><w:tc><w:p>a</w:p></w:tc><w:tc><w:p>b</w:p></w:tc></w:tr></w:tbl></w:body></w:document>"))
 	zw.Close()
 
 	out, err := extractDocx(buf.Bytes())
 	if err != nil {
 		t.Fatalf("extractDocx: %v", err)
 	}
-	if !strings.Contains(out, "Alpha \tBeta") {
-		t.Errorf("table cells not tab-separated: %q", out)
+	if !strings.Contains(out, "a\tb") {
+		t.Errorf("table cells not tab-separated as 'a\\tb': %q", out)
 	}
 }
 
