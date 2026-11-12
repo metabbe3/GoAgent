@@ -34,6 +34,7 @@ type Client struct {
 	httpClient   *http.Client
 	backoffBase  time.Duration
 	stopChan     chan struct{}
+	stopOnce     sync.Once
 	mu           sync.Mutex
 	runningTasks map[string]context.CancelFunc
 	abortedTasks map[string]bool
@@ -81,16 +82,19 @@ func (c *Client) Start(ctx context.Context) error {
 		return err
 	}
 
-	// 2. Start heartbeat goroutine
-	go c.heartbeatLoop(ctx)
-
-	// 3. Start task polling loop
-	return c.pollLoop(ctx)
+	sessCtx, cancel := context.WithCancel(ctx)
+	defer cancel() // heartbeat goroutine mati saat pollLoop keluar
+	go c.heartbeatLoop(sessCtx)
+	err := c.pollLoop(sessCtx)
+	cancel()
+	return err
 }
 
 // Stop terminates the worker loops.
 func (c *Client) Stop() {
-	close(c.stopChan)
+	c.stopOnce.Do(func() {
+		close(c.stopChan)
+	})
 	if c.httpClient != nil {
 		c.httpClient.CloseIdleConnections()
 	}
@@ -324,6 +328,7 @@ func (c *Client) executeAndReportTask(ctx context.Context, task *Task) {
 	}
 
 	redactedResult, _ := guardrail.Redact(result)
+	redactedErr, _ := guardrail.Redact(errMsg)
 
 	if iterations <= 0 {
 		iterations = 1
@@ -335,7 +340,7 @@ func (c *Client) executeAndReportTask(ctx context.Context, task *Task) {
 		MissionID: task.MissionID,
 		Success:   success,
 		Result:    redactedResult,
-		Error:     errMsg,
+		Error:     redactedErr,
 		Metrics: ReportMetrics{
 			Iterations: iterations,
 			ElapsedMs:  elapsed.Milliseconds(),
@@ -380,6 +385,7 @@ func (c *Client) runTaskWithFanout(ctx context.Context, task *Task, allowFanout 
 		log.Printf("[mesh] fanout: planner failed: %v, reporting original error", planErr)
 		return "", 1, execErr
 	}
+	planRaw, _ = guardrail.Redact(planRaw)
 
 	subGoals := parseSubGoalsJSON(planRaw)
 	if len(subGoals) <= 1 {
@@ -389,6 +395,13 @@ func (c *Client) runTaskWithFanout(ctx context.Context, task *Task, allowFanout 
 
 	if len(subGoals) > fanoutMax {
 		subGoals = subGoals[:fanoutMax]
+	}
+
+	for i, sg := range subGoals {
+		if flags := guardrail.DocInjectionFlags(sg); len(flags) > 0 {
+			log.Printf("[mesh] task goal flagged as potential injection — framed as data")
+			subGoals[i] = guardrail.FrameDocumentContent("mesh_task", sg)
+		}
 	}
 
 	log.Printf("[mesh] fanout: split into %d sub-goals for task %s", len(subGoals), task.ID)
@@ -404,8 +417,10 @@ func (c *Client) runTaskWithFanout(ctx context.Context, task *Task, allowFanout 
 	var subTimeout time.Duration
 	if deadline, ok := ctx.Deadline(); ok {
 		rem := time.Until(deadline)
-		if rem > 0 && numSub > 0 {
-			subTimeout = rem / time.Duration(numSub)
+		if rem > 5*time.Second {
+			subTimeout = rem - 2*time.Second
+		} else if rem > 0 {
+			subTimeout = rem
 		}
 	}
 
@@ -441,6 +456,7 @@ func (c *Client) runTaskWithFanout(ctx context.Context, task *Task, allowFanout 
 
 	// Step 3 & 4: Combine results and compute metrics
 	var successResults []string
+	var failedGoals []string
 	successCount := 0
 	var firstErr error
 
@@ -452,6 +468,8 @@ func (c *Client) runTaskWithFanout(ctx context.Context, task *Task, allowFanout 
 			if firstErr == nil {
 				firstErr = o.err
 			}
+			redactedGoal, _ := guardrail.Redact(subGoals[i])
+			failedGoals = append(failedGoals, redactedGoal)
 			log.Printf("[mesh] fanout: sub-goal %d failed for task %s: %v", i+1, task.ID, o.err)
 		}
 	}
@@ -466,6 +484,10 @@ func (c *Client) runTaskWithFanout(ctx context.Context, task *Task, allowFanout 
 	}
 
 	combined := strings.Join(successResults, "\n\n")
+	if successCount < numSub {
+		header := fmt.Sprintf("[partial: %d/%d sub-goals succeeded; failed: %s]\n\n", successCount, numSub, strings.Join(failedGoals, "; "))
+		combined = header + combined
+	}
 	return combined, successCount, nil
 }
 

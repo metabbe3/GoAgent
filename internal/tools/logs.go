@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -146,7 +147,7 @@ func (r *Registry) registerLogsTools() {
 	}, r.handleLogTimeline)
 }
 
-func (r *Registry) handleReadLog(argsJSON string) (string, error) {
+func (r *Registry) handleReadLog(_ context.Context, argsJSON string) (string, error) {
 	var in readLogInput
 	if err := json.Unmarshal([]byte(argsJSON), &in); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -230,7 +231,7 @@ func (r *Registry) handleReadLog(argsJSON string) (string, error) {
 	return sb.String(), nil
 }
 
-func (r *Registry) handleAnalyzeLogs(argsJSON string) (string, error) {
+func (r *Registry) handleAnalyzeLogs(_ context.Context, argsJSON string) (string, error) {
 	var in analyzeLogsInput
 	if err := json.Unmarshal([]byte(argsJSON), &in); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -271,7 +272,7 @@ func (r *Registry) handleAnalyzeLogs(argsJSON string) (string, error) {
 	return string(data), nil
 }
 
-func (r *Registry) handleLearnedPatterns(argsJSON string) (string, error) {
+func (r *Registry) handleLearnedPatterns(_ context.Context, argsJSON string) (string, error) {
 	var in learnedPatternsInput
 	_ = json.Unmarshal([]byte(argsJSON), &in)
 
@@ -296,7 +297,7 @@ func (r *Registry) handleLearnedPatterns(argsJSON string) (string, error) {
 	return string(data), nil
 }
 
-func (r *Registry) handleLogTimeline(argsJSON string) (string, error) {
+func (r *Registry) handleLogTimeline(_ context.Context, argsJSON string) (string, error) {
 	var in logTimelineInput
 	if err := json.Unmarshal([]byte(argsJSON), &in); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)

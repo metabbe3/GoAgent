@@ -81,7 +81,7 @@ func (r *Registry) registerWebTools() {
 	}, r.handleFetchURL)
 }
 
-func (r *Registry) handleFetchURL(argsJSON string) (string, error) {
+func (r *Registry) handleFetchURL(ctx context.Context, argsJSON string) (string, error) {
 	var args struct {
 		URL string `json:"url"`
 	}
@@ -100,7 +100,7 @@ func (r *Registry) handleFetchURL(argsJSON string) (string, error) {
 		Timeout:   webTimeout,
 	}
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return "", err
 	}

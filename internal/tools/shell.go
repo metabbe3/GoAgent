@@ -37,7 +37,7 @@ func (r *Registry) registerShellTools() {
 	}, r.handleRunCommand)
 }
 
-func (r *Registry) handleRunCommand(argsJSON string) (string, error) {
+func (r *Registry) handleRunCommand(ctx context.Context, argsJSON string) (string, error) {
 	var in runCommandInput
 	if err := json.Unmarshal([]byte(argsJSON), &in); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -62,13 +62,13 @@ func (r *Registry) handleRunCommand(argsJSON string) (string, error) {
 		timeoutSec = 30
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
+	cmd := exec.CommandContext(runCtx, "sh", "-c", cmdStr)
 	out, err := cmd.CombinedOutput()
 
-	if ctx.Err() == context.DeadlineExceeded {
+	if runCtx.Err() == context.DeadlineExceeded || ctx.Err() != nil {
 		return "", fmt.Errorf("command timed out after %d seconds", timeoutSec)
 	}
 

@@ -51,9 +51,10 @@ type ToolFunctionDef struct {
 
 // ChatRequest represents the payload sent to /chat/completions.
 type ChatRequest struct {
-	Model    string           `json:"model"`
-	Messages []ChatMessage    `json:"messages"`
-	Tools    []ToolDefinition `json:"tools,omitempty"`
+	Model     string           `json:"model"`
+	Messages  []ChatMessage    `json:"messages"`
+	Tools     []ToolDefinition `json:"tools,omitempty"`
+	MaxTokens int              `json:"max_tokens,omitempty"`
 }
 
 // ChatChoice represents an individual choice in the completion response.
@@ -168,6 +169,26 @@ func (c *Client) ChatCompletionHeavy(ctx context.Context, messages []ChatMessage
 		Tools:    tools,
 	}
 	return c.doCompletion(ctx, reqBody)
+}
+
+// Ping verifies connectivity to the LLM endpoint by requesting a minimal completion.
+func (c *Client) Ping(ctx context.Context) error {
+	pingCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	reqBody := ChatRequest{
+		Model: c.model,
+		Messages: []ChatMessage{
+			{Role: "user", Content: "ping"},
+		},
+		MaxTokens: 1,
+	}
+	_, err := c.doCompletion(pingCtx, reqBody)
+	if err != nil && (strings.Contains(err.Error(), "max_tokens") || strings.Contains(err.Error(), "400")) {
+		reqBody.MaxTokens = 0
+		_, err = c.doCompletion(pingCtx, reqBody)
+	}
+	return err
 }
 
 func (c *Client) doCompletion(ctx context.Context, reqBody ChatRequest) (*ChatMessage, error) {

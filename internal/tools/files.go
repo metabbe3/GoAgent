@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -86,7 +87,7 @@ func (r *Registry) registerFilesTools() {
 	}, r.handleListDir)
 }
 
-func (r *Registry) handleReadFile(argsJSON string) (string, error) {
+func (r *Registry) handleReadFile(_ context.Context, argsJSON string) (string, error) {
 	var in readFileInput
 	if err := json.Unmarshal([]byte(argsJSON), &in); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -150,7 +151,7 @@ func (r *Registry) handleReadFile(argsJSON string) (string, error) {
 	return sb.String(), nil
 }
 
-func (r *Registry) handleWriteFile(argsJSON string) (string, error) {
+func (r *Registry) handleWriteFile(_ context.Context, argsJSON string) (string, error) {
 	var in writeFileInput
 	if err := json.Unmarshal([]byte(argsJSON), &in); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -177,7 +178,7 @@ func (r *Registry) handleWriteFile(argsJSON string) (string, error) {
 	return fmt.Sprintf("Successfully wrote %d bytes to %s", len(in.Content), in.Path), nil
 }
 
-func (r *Registry) handleListDir(argsJSON string) (string, error) {
+func (r *Registry) handleListDir(_ context.Context, argsJSON string) (string, error) {
 	var in listDirInput
 	_ = json.Unmarshal([]byte(argsJSON), &in)
 

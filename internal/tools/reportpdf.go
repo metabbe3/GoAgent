@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -48,7 +49,7 @@ func (r *Registry) registerGenerateTools(dataDir string) {
 				[]string{"title", "markdown"},
 			),
 		},
-	}, func(argsJSON string) (string, error) {
+	}, func(_ context.Context, argsJSON string) (string, error) {
 		return handleGeneratePDF(dataDir, argsJSON)
 	})
 }

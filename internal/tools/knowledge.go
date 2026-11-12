@@ -53,7 +53,7 @@ func (r *Registry) RegisterKnowledgeTools(ix *kb.Index) {
 	}, r.handleSaveKnowledge)
 }
 
-func (r *Registry) handleSearchKnowledge(argsJSON string) (string, error) {
+func (r *Registry) handleSearchKnowledge(ctx context.Context, argsJSON string) (string, error) {
 	var args struct {
 		Query string `json:"query"`
 	}
@@ -74,7 +74,7 @@ func (r *Registry) handleSearchKnowledge(argsJSON string) (string, error) {
 		return "", fmt.Errorf("embedding not configured")
 	}
 
-	hits, err := ix.Search(context.Background(), q, searchTopK)
+	hits, err := ix.Search(ctx, q, searchTopK)
 	if err != nil {
 		return "", err
 	}
@@ -89,7 +89,7 @@ func (r *Registry) handleSearchKnowledge(argsJSON string) (string, error) {
 	return strings.TrimSpace(sb.String()), nil
 }
 
-func (r *Registry) handleSaveKnowledge(argsJSON string) (string, error) {
+func (r *Registry) handleSaveKnowledge(ctx context.Context, argsJSON string) (string, error) {
 	var args struct {
 		Title   string `json:"title"`
 		Content string `json:"content"`
@@ -115,7 +115,7 @@ func (r *Registry) handleSaveKnowledge(argsJSON string) (string, error) {
 		return "", fmt.Errorf("embedding not configured")
 	}
 
-	if err := ix.Save(context.Background(), title, content); err != nil {
+	if err := ix.Save(ctx, title, content); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("Saved %d characters under %q into knowledge base. Use search_knowledge to query it.", len(content), title), nil

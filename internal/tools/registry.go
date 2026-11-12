@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -10,7 +11,7 @@ import (
 )
 
 // ToolHandler is a function that executes a tool with parsed JSON arguments.
-type ToolHandler func(argsJSON string) (string, error)
+type ToolHandler func(ctx context.Context, argsJSON string) (string, error)
 
 // Tool represents a registered agent tool.
 type Tool struct {
@@ -100,7 +101,7 @@ func (r *Registry) GetDefinitions() []llm.ToolDefinition {
 }
 
 // Execute runs the named tool with the given JSON arguments.
-func (r *Registry) Execute(name, argsJSON string) (string, error) {
+func (r *Registry) Execute(ctx context.Context, name, argsJSON string) (string, error) {
 	r.mu.RLock()
 	tool, exists := r.tools[name]
 	r.mu.RUnlock()
@@ -113,7 +114,7 @@ func (r *Registry) Execute(name, argsJSON string) (string, error) {
 		argsJSON = "{}"
 	}
 
-	result, err := tool.Handler(argsJSON)
+	result, err := tool.Handler(ctx, argsJSON)
 	if err != nil {
 		return fmt.Sprintf("Error executing %s: %v", name, err), nil
 	}

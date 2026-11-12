@@ -1,6 +1,7 @@
 package mesh
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -45,7 +46,7 @@ func RegisterLeaderTools(r *tools.Registry, s *Server) {
 				"required": []string{"mission", "subtasks"},
 			},
 		},
-	}, func(argsJSON string) (string, error) {
+	}, func(_ context.Context, argsJSON string) (string, error) {
 		var args struct {
 			Mission  string         `json:"mission"`
 			Subtasks []SubtaskInput `json:"subtasks"`
@@ -81,7 +82,7 @@ func RegisterLeaderTools(r *tools.Registry, s *Server) {
 				"properties": map[string]any{},
 			},
 		},
-	}, func(_ string) (string, error) {
+	}, func(_ context.Context, _ string) (string, error) {
 		workers := q.ListWorkers()
 		if len(workers) == 0 {
 			return "No workers currently registered in GoMesh cluster.", nil
@@ -113,7 +114,7 @@ func RegisterLeaderTools(r *tools.Registry, s *Server) {
 				"required": []string{"mission_id"},
 			},
 		},
-	}, func(argsJSON string) (string, error) {
+	}, func(_ context.Context, argsJSON string) (string, error) {
 		var args struct {
 			MissionID string `json:"mission_id"`
 		}
@@ -145,7 +146,7 @@ func RegisterLeaderTools(r *tools.Registry, s *Server) {
 				"required": []string{"mission_id"},
 			},
 		},
-	}, func(argsJSON string) (string, error) {
+	}, func(_ context.Context, argsJSON string) (string, error) {
 		var args struct {
 			MissionID string `json:"mission_id"`
 		}
@@ -172,7 +173,7 @@ func RegisterLeaderTools(r *tools.Registry, s *Server) {
 				"required": []string{"mission_id"},
 			},
 		},
-	}, func(argsJSON string) (string, error) {
+	}, func(_ context.Context, argsJSON string) (string, error) {
 		var args struct {
 			MissionID string `json:"mission_id"`
 		}
@@ -199,7 +200,7 @@ func RegisterLeaderTools(r *tools.Registry, s *Server) {
 				"required": []string{"mission_id", "result"},
 			},
 		},
-	}, func(argsJSON string) (string, error) {
+	}, func(_ context.Context, argsJSON string) (string, error) {
 		var args struct {
 			MissionID string `json:"mission_id"`
 			Result    string `json:"result"`
@@ -227,15 +228,16 @@ func RegisterLeaderTools(r *tools.Registry, s *Server) {
 				"properties": map[string]any{},
 			},
 		},
-	}, func(_ string) (string, error) {
+	}, func(_ context.Context, _ string) (string, error) {
 		workers := q.ListWorkers()
+		pending, inFlight := q.Stats()
 		info := map[string]any{
 			"role":            "leader",
 			"protocol":        MeshProtocol,
 			"listen":          s.Addr(),
 			"workers_total":   len(workers),
-			"pending_tasks":   len(q.pendingTasks),
-			"in_flight_tasks": len(q.inFlightTasks),
+			"pending_tasks":   pending,
+			"in_flight_tasks": inFlight,
 		}
 		data, _ := json.MarshalIndent(info, "", "  ")
 		return string(data), nil

@@ -11,6 +11,7 @@ import (
 
 	"github.com/metabbe3/GoAgent/internal/agent"
 	"github.com/metabbe3/GoAgent/internal/config"
+	"github.com/metabbe3/GoAgent/internal/guardrail"
 	"github.com/metabbe3/GoAgent/internal/kb"
 	"github.com/metabbe3/GoAgent/internal/llm"
 	"github.com/metabbe3/GoAgent/internal/mesh"
@@ -98,8 +99,17 @@ func main() {
 		if cfg.LeaderAddr == "" {
 			log.Fatalf("[mesh] GOAGENT_LEADER_ADDR is required for worker mode")
 		}
+		if os.Getenv("GOAGENT_SKIP_LLM_CHECK") != "true" {
+			if err := llmClient.Ping(ctx); err != nil {
+				log.Fatalf("[mesh] LLM sanity check failed (LLM_BASE_URL/LLM_API_KEY/LLM_MODEL): %v", err)
+			}
+		}
 		log.Printf("[mesh] starting GoAgent in WORKER mode (ID: %s, Caps: %v)...", cfg.WorkerID, cfg.Capabilities)
 		runFunc := func(taskCtx context.Context, goal string) (string, error) {
+			if flags := guardrail.DocInjectionFlags(goal); len(flags) > 0 {
+				log.Printf("[mesh] task goal flagged as potential injection — framed as data")
+				goal = guardrail.FrameDocumentContent("mesh_task", goal)
+			}
 			reply, _, err := agentLoop.Run(taskCtx, goal, nil)
 			return reply, err
 		}
@@ -108,6 +118,10 @@ func main() {
 		client.SetFanoutMax(cfg.FanoutMax)
 		if cfg.FanoutMax > 0 {
 			client.SetPlanFunc(func(planCtx context.Context, goal string) (string, error) {
+				if flags := guardrail.DocInjectionFlags(goal); len(flags) > 0 {
+					log.Printf("[mesh] task goal flagged as potential injection — framed as data")
+					goal = guardrail.FrameDocumentContent("mesh_task", goal)
+				}
 				prompt := fmt.Sprintf("Split this goal into at most %d independent sub-goals. Reply with ONE JSON array of strings only.\n\nGoal: %s", cfg.FanoutMax, goal)
 				msg, err := llmClient.ChatCompletion(planCtx, []llm.ChatMessage{
 					{Role: "user", Content: prompt},

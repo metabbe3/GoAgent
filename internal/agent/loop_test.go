@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/metabbe3/GoAgent/internal/config"
 	"github.com/metabbe3/GoAgent/internal/llm"
@@ -292,7 +293,7 @@ func TestToolPanicRecover(t *testing.T) {
 	reg.Register(llm.ToolDefinition{
 		Type:     "function",
 		Function: llm.ToolFunctionDef{Name: "panic_tool"},
-	}, func(args string) (string, error) {
+	}, func(_ context.Context, args string) (string, error) {
 		panic("simulated explosion")
 	})
 
@@ -326,5 +327,70 @@ func TestHourPrecisionClock(t *testing.T) {
 	}
 	if !strings.Contains(sys, "h UTC") {
 		t.Fatalf("clock format should contain 'h UTC', got: %s", sys)
+	}
+}
+
+func TestLoopToolContextTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := llm.ChatResponse{
+			ID: "chatcmpl-slow",
+			Choices: []llm.ChatChoice{
+				{
+					Index: 0,
+					Message: llm.ChatMessage{
+						Role: "assistant",
+						ToolCalls: []llm.ToolCall{
+							{
+								ID:   "call_slow_1",
+								Type: "function",
+								Function: llm.FunctionCall{
+									Name:      "slow_tool",
+									Arguments: "{}",
+								},
+							},
+						},
+					},
+					FinishReason: "tool_calls",
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		LLMBaseURL: server.URL,
+		LLMAPIKey:  "key",
+		LLMModel:   "model",
+	}
+	llmClient := llm.NewClient(cfg)
+	reg := tools.NewRegistry(cfg)
+
+	reg.Register(llm.ToolDefinition{
+		Type:     "function",
+		Function: llm.ToolFunctionDef{Name: "slow_tool"},
+	}, func(ctx context.Context, _ string) (string, error) {
+		select {
+		case <-time.After(10 * time.Second):
+			return "done", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	})
+
+	agentLoop := NewLoop(llmClient, reg, 5)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, _, err := agentLoop.Run(ctx, "run slow", nil)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected error due to context timeout, got nil")
+	}
+	if elapsed >= 3*time.Second {
+		t.Fatalf("loop should complete in < 3s when ctx times out, took %v", elapsed)
 	}
 }

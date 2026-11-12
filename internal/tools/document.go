@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -29,7 +30,7 @@ func (r *Registry) registerDocumentTools() {
 	}, r.handleReadDocument)
 }
 
-func (r *Registry) handleReadDocument(argsJSON string) (string, error) {
+func (r *Registry) handleReadDocument(_ context.Context, argsJSON string) (string, error) {
 	var args struct {
 		Path string `json:"path"`
 	}

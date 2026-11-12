@@ -135,6 +135,7 @@ func (l *Loop) run(ctx context.Context, userText string, history []llm.ChatMessa
 		// Parallel execution of tool calls (max 4 concurrent), preserving deterministic order
 		toolCalls := assistantMsg.ToolCalls
 		results := make([]toolResult, len(toolCalls))
+		var resultsMu sync.Mutex
 		sem := make(chan struct{}, MaxConcurrentTools)
 		var wg sync.WaitGroup
 
@@ -147,12 +148,14 @@ func (l *Loop) run(ctx context.Context, userText string, history []llm.ChatMessa
 				defer func() {
 					if r := recover(); r != nil {
 						log.Printf("[agent] PANIC in tool %s: %v\n%s", call.Function.Name, r, debug.Stack())
+						resultsMu.Lock()
 						results[idx] = toolResult{
 							index:      idx,
 							toolCallID: call.ID,
 							name:       call.Function.Name,
 							content:    fmt.Sprintf("Error: internal tool failure (%s): %v", call.Function.Name, r),
 						}
+						resultsMu.Unlock()
 					}
 				}()
 
@@ -160,7 +163,7 @@ func (l *Loop) run(ctx context.Context, userText string, history []llm.ChatMessa
 				defer func() { <-sem }()
 
 				log.Printf("[agent] executing tool %s (id: %s) [worker]", call.Function.Name, call.ID)
-				output, err := l.registry.Execute(call.Function.Name, call.Function.Arguments)
+				output, err := l.registry.Execute(ctx, call.Function.Name, call.Function.Arguments)
 				if err != nil {
 					output = fmt.Sprintf("Error executing tool: %v", err)
 				}
@@ -168,24 +171,51 @@ func (l *Loop) run(ctx context.Context, userText string, history []llm.ChatMessa
 				truncated := TruncateToolOutput(output, l.registry.ResultCap(call.Function.Name))
 				redacted, _ := guardrail.Redact(truncated)
 
+				resultsMu.Lock()
 				results[idx] = toolResult{
 					index:      idx,
 					toolCallID: call.ID,
 					name:       call.Function.Name,
 					content:    redacted,
 				}
+				resultsMu.Unlock()
 			}(i, tc)
 		}
 
-		wg.Wait()
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
 
-		for _, res := range results {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			// remaining goroutines will finish on their own; results not yet gathered are considered timeout failures
+		}
+
+		for idx, tc := range toolCalls {
+			resultsMu.Lock()
+			res := results[idx]
+			resultsMu.Unlock()
+			if res.toolCallID == "" {
+				res = toolResult{
+					index:      idx,
+					toolCallID: tc.ID,
+					name:       tc.Function.Name,
+					content:    fmt.Sprintf("Error executing %s: context cancelled or timed out: %v", tc.Function.Name, ctx.Err()),
+				}
+			}
 			messages = append(messages, llm.ChatMessage{
 				Role:       "tool",
 				ToolCallID: res.toolCallID,
 				Name:       res.name,
 				Content:    res.content,
 			})
+		}
+
+		if ctx.Err() != nil {
+			return "", messages, ctx.Err()
 		}
 	}
 

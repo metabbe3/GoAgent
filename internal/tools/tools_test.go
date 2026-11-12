@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -23,7 +24,7 @@ func TestReadWriteFileRoundtrip(t *testing.T) {
 		Path:    filePath,
 		Content: "Line 1\nLine 2\nLine 3\n",
 	})
-	wRes, err := reg.Execute("write_file", string(writeArgs))
+	wRes, err := reg.Execute(context.Background(), "write_file", string(writeArgs))
 	if err != nil {
 		t.Fatalf("write_file returned error: %v", err)
 	}
@@ -37,7 +38,7 @@ func TestReadWriteFileRoundtrip(t *testing.T) {
 		Offset: 2,
 		Limit:  2,
 	})
-	rRes, err := reg.Execute("read_file", string(readArgs))
+	rRes, err := reg.Execute(context.Background(), "read_file", string(readArgs))
 	if err != nil {
 		t.Fatalf("read_file returned error: %v", err)
 	}
@@ -57,7 +58,7 @@ func TestListDir(t *testing.T) {
 
 	reg := NewRegistry(nil)
 	args, _ := json.Marshal(listDirInput{Path: tmpDir})
-	res, err := reg.Execute("list_dir", string(args))
+	res, err := reg.Execute(context.Background(), "list_dir", string(args))
 	if err != nil {
 		t.Fatalf("list_dir failed: %v", err)
 	}
@@ -74,7 +75,7 @@ func TestRunCommandAllowlist(t *testing.T) {
 	allowedArgs, _ := json.Marshal(runCommandInput{
 		Cmd: "uname -s",
 	})
-	res, err := reg.Execute("run_command", string(allowedArgs))
+	res, err := reg.Execute(context.Background(), "run_command", string(allowedArgs))
 	if err != nil {
 		t.Fatalf("allowed command returned error: %v", err)
 	}
@@ -86,7 +87,7 @@ func TestRunCommandAllowlist(t *testing.T) {
 	disallowedArgs, _ := json.Marshal(runCommandInput{
 		Cmd: "rm -rf /tmp/some_file",
 	})
-	res, err = reg.Execute("run_command", string(disallowedArgs))
+	res, err = reg.Execute(context.Background(), "run_command", string(disallowedArgs))
 	if err != nil {
 		t.Fatalf("Execute should return formatted error message, got: %v", err)
 	}
@@ -98,7 +99,7 @@ func TestRunCommandAllowlist(t *testing.T) {
 	nonAllowlistArgs, _ := json.Marshal(runCommandInput{
 		Cmd: "git status",
 	})
-	res, err = reg.Execute("run_command", string(nonAllowlistArgs))
+	res, err = reg.Execute(context.Background(), "run_command", string(nonAllowlistArgs))
 	if err != nil {
 		t.Fatalf("Execute should return formatted error message, got: %v", err)
 	}
@@ -110,7 +111,7 @@ func TestRunCommandAllowlist(t *testing.T) {
 	redirectArgs, _ := json.Marshal(runCommandInput{
 		Cmd: "echo 'bad' > /tmp/bad.txt",
 	})
-	res, err = reg.Execute("run_command", string(redirectArgs))
+	res, err = reg.Execute(context.Background(), "run_command", string(redirectArgs))
 	if err != nil {
 		t.Fatalf("unexpected execution error: %v", err)
 	}
@@ -128,7 +129,7 @@ func TestRunCommandTimeout(t *testing.T) {
 		TimeoutSec: 1,
 	})
 
-	res, err := reg.Execute("run_command", string(timeoutArgs))
+	res, err := reg.Execute(context.Background(), "run_command", string(timeoutArgs))
 	if err != nil {
 		t.Fatalf("unexpected execution error: %v", err)
 	}
@@ -160,7 +161,7 @@ func TestReadLogAndLogAnalysis(t *testing.T) {
 		Tail:        2,
 		FilterRegex: "ERROR|ping",
 	})
-	rlRes, err := reg.Execute("read_log", string(readLogArgs))
+	rlRes, err := reg.Execute(context.Background(), "read_log", string(readLogArgs))
 	if err != nil {
 		t.Fatalf("read_log failed: %v", err)
 	}
@@ -173,7 +174,7 @@ func TestReadLogAndLogAnalysis(t *testing.T) {
 		Path: logFile,
 		Top:  5,
 	})
-	anRes, err := reg.Execute("analyze_logs", string(analyzeArgs))
+	anRes, err := reg.Execute(context.Background(), "analyze_logs", string(analyzeArgs))
 	if err != nil {
 		t.Fatalf("analyze_logs failed: %v", err)
 	}
@@ -187,7 +188,7 @@ func TestReadLogAndLogAnalysis(t *testing.T) {
 	}
 
 	// Test learned_patterns
-	learnRes, err := reg.Execute("learned_patterns", "{}")
+	learnRes, err := reg.Execute(context.Background(), "learned_patterns", "{}")
 	if err != nil {
 		t.Fatalf("learned_patterns failed: %v", err)
 	}
@@ -201,7 +202,7 @@ func TestReadLogAndLogAnalysis(t *testing.T) {
 		PatternRegex: "connection lost",
 		Context:      1,
 	})
-	tlRes, err := reg.Execute("log_timeline", string(timelineArgs))
+	tlRes, err := reg.Execute(context.Background(), "log_timeline", string(timelineArgs))
 	if err != nil {
 		t.Fatalf("log_timeline failed: %v", err)
 	}
@@ -220,7 +221,7 @@ func TestReadDocument(t *testing.T) {
 
 	reg := NewRegistry(nil)
 	args, _ := json.Marshal(map[string]string{"path": docFile})
-	res, err := reg.Execute("read_document", string(args))
+	res, err := reg.Execute(context.Background(), "read_document", string(args))
 	if err != nil {
 		t.Fatalf("read_document failed: %v", err)
 	}
@@ -241,7 +242,7 @@ func TestGeneratePDF(t *testing.T) {
 		"title":    "Diagnostic Report",
 		"markdown": "# Header\n- Finding 1\n- Finding 2\n\nAll services normal.",
 	})
-	res, err := reg.Execute("generate_pdf", string(args))
+	res, err := reg.Execute(context.Background(), "generate_pdf", string(args))
 	if err != nil {
 		t.Fatalf("generate_pdf failed: %v", err)
 	}
@@ -254,7 +255,7 @@ func TestGeneratePDF(t *testing.T) {
 		"title":    "Report",
 		"markdown": "测试中文",
 	})
-	cjkRes, _ := reg.Execute("generate_pdf", string(cjkArgs))
+	cjkRes, _ := reg.Execute(context.Background(), "generate_pdf", string(cjkArgs))
 	if !strings.Contains(cjkRes, "Chinese/Japanese/Korean text") {
 		t.Errorf("expected CJK rejection error, got: %s", cjkRes)
 	}
@@ -263,7 +264,7 @@ func TestGeneratePDF(t *testing.T) {
 func TestFetchURLSSRFBlocked(t *testing.T) {
 	reg := NewRegistry(nil)
 	args, _ := json.Marshal(map[string]string{"url": "http://127.0.0.1:9999/admin"})
-	res, err := reg.Execute("fetch_url", string(args))
+	res, err := reg.Execute(context.Background(), "fetch_url", string(args))
 	if err != nil {
 		t.Fatalf("unexpected handler err: %v", err)
 	}

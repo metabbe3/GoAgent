@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+const (
+	MaxPendingTasks   = 1000
+	MaxActiveMissions = 100
+)
+
 // SubtaskInput represents a requested subtask for a mission.
 type SubtaskInput struct {
 	Goal       string `json:"goal"`
@@ -29,6 +34,7 @@ type QueueEvent struct {
 	MissionID string        `json:"mission_id,omitempty"`
 	WorkerID  string        `json:"worker_id,omitempty"`
 	Report    *ReportReq    `json:"report,omitempty"`
+	Attempts  int           `json:"attempts,omitempty"`
 }
 
 type waiter struct {
@@ -172,10 +178,30 @@ func (q *Queue) ListWorkers() []WorkerInfo {
 	return out
 }
 
+// Stats returns the count of pending and in-flight tasks in a thread-safe manner.
+func (q *Queue) Stats() (pending int, inFlight int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.pendingTasks), len(q.inFlightTasks)
+}
+
 // AddMission enqueues a new mission with its subtasks.
 func (q *Queue) AddMission(text string, subtasks []SubtaskInput) (*MissionState, error) {
 	if len(subtasks) == 0 {
 		return nil, fmt.Errorf("mission must have at least one subtask")
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	activeMissions := 0
+	for _, m := range q.missions {
+		if m.Status == "pending" || m.Status == "in_progress" {
+			activeMissions++
+		}
+	}
+	if len(q.pendingTasks)+len(subtasks) > MaxPendingTasks || activeMissions >= MaxActiveMissions {
+		return nil, fmt.Errorf("mesh queue full (max %d pending / %d active missions)", MaxPendingTasks, MaxActiveMissions)
 	}
 
 	missionID := generateID("m")
@@ -214,7 +240,6 @@ func (q *Queue) AddMission(text string, subtasks []SubtaskInput) (*MissionState,
 		newTasks[i] = task
 	}
 
-	q.mu.Lock()
 	q.missions[missionID] = mission
 	for _, t := range newTasks {
 		q.tasks[t.ID] = t
@@ -229,7 +254,6 @@ func (q *Queue) AddMission(text string, subtasks []SubtaskInput) (*MissionState,
 
 	// Try dispatching immediately to matching long-polling workers
 	q.dispatchPendingLocked()
-	q.mu.Unlock()
 
 	return mission, nil
 }
@@ -385,6 +409,47 @@ func (q *Queue) dispatchPendingLocked() {
 	q.pendingTasks = remPending
 }
 
+// RequeueOnDispatchFailure returns a task to pending when the long-poll
+// response write fails (worker disconnected right at dispatch).
+func (q *Queue) RequeueOnDispatchFailure(taskID string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	task, ok := q.inFlightTasks[taskID]
+	if !ok {
+		return
+	} // already reported/timed out — fine
+	delete(q.inFlightTasks, taskID)
+	if inflight, ok := q.workerInFlight[task.AssignedTo]; ok {
+		delete(inflight, taskID)
+	}
+	if w, ok := q.workers[task.AssignedTo]; ok {
+		w.InFlight = len(q.workerInFlight[task.AssignedTo])
+	}
+	task.AssignedTo = ""
+	task.AssignedAt = time.Time{}
+	q.pendingTasks = append(q.pendingTasks, task)
+	// subtask status back to pending
+	attempts := task.Attempts
+	if m, ok := q.missions[task.MissionID]; ok {
+		for i := range m.Subtasks {
+			if m.Subtasks[i].ID == task.ID {
+				m.Subtasks[i].Status = "pending"
+				m.Subtasks[i].AssignedTo = ""
+				attempts = m.Subtasks[i].Attempts
+				break
+			}
+		}
+	}
+	q.appendEvent(QueueEvent{
+		Type:      "task_requeued",
+		Time:      time.Now(),
+		TaskID:    task.ID,
+		MissionID: task.MissionID,
+		Attempts:  attempts,
+	})
+	q.dispatchPendingLocked()
+}
+
 // ReportTask records completion or failure of an in-flight task.
 func (q *Queue) ReportTask(req ReportReq) error {
 	q.mu.Lock()
@@ -395,6 +460,15 @@ func (q *Queue) ReportTask(req ReportReq) error {
 		// Task might have already timed out or completed
 		log.Printf("[mesh] ignoring report for untracked task %s from worker %s", req.TaskID, req.WorkerID)
 		return nil
+	}
+
+	if task.AssignedTo != req.WorkerID {
+		if req.Error == "aborted by leader" || strings.HasPrefix(req.Error, "aborted") {
+			log.Printf("[mesh] ignoring stale abort report for task %s from former worker %s (now assigned to %s)", req.TaskID, req.WorkerID, task.AssignedTo)
+			return nil
+		}
+		log.Printf("[mesh] rejecting spoofed report: task %s assigned to %s, report from %s", req.TaskID, task.AssignedTo, req.WorkerID)
+		return fmt.Errorf("task %s is not assigned to worker %s", req.TaskID, req.WorkerID)
 	}
 
 	delete(q.inFlightTasks, req.TaskID)
@@ -466,12 +540,31 @@ func (q *Queue) ReportTask(req ReportReq) error {
 
 	// Dispatch remaining pending tasks if waiters are ready
 	if requeued {
+		var attempts int
+		if m, ok := q.missions[req.MissionID]; ok {
+			for _, st := range m.Subtasks {
+				if st.ID == req.TaskID {
+					attempts = st.Attempts
+					break
+				}
+			}
+		}
+		q.appendEvent(QueueEvent{
+			Type:      "task_requeued",
+			Time:      now,
+			TaskID:    req.TaskID,
+			MissionID: req.MissionID,
+			Attempts:  attempts,
+		})
 		q.dispatchPendingLocked()
 	}
 	return nil
 }
 
 func (q *Queue) checkMissionCompletionLocked(m *MissionState, now time.Time) {
+	if m.Status == "cancelled" {
+		return
+	}
 	allDone := true
 	anyFailed := false
 	for _, st := range m.Subtasks {
@@ -558,6 +651,9 @@ func (q *Queue) MissionStatus(missionID string) (*MissionState, error) {
 // mission (and into the event log) so a leader restart between synthesis
 // and delivery does not lose it.
 func (q *Queue) SetMissionResult(missionID, result string) error {
+	if len(result) > 64<<10 {
+		return fmt.Errorf("result too large (%d bytes, max 64KB)", len(result))
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -729,6 +825,13 @@ func (q *Queue) SweepTaskTimeouts() int {
 					m.Subtasks[subtaskIdx].Status = "pending"
 					m.Subtasks[subtaskIdx].AssignedTo = ""
 				}
+				q.appendEvent(QueueEvent{
+					Type:      "task_requeued",
+					Time:      now,
+					TaskID:    taskID,
+					MissionID: task.MissionID,
+					Attempts:  attempts,
+				})
 				log.Printf("[mesh] task %s timed out on %s, requeued (attempt %d/%d)", taskID, workerID, attempts, q.maxSubtaskAttempts)
 			} else {
 				// Failed
@@ -778,19 +881,30 @@ func (q *Queue) SweepDeadWorkers(deadTimeout time.Duration) int {
 					delete(q.inFlightTasks, taskID)
 					delete(inflight, taskID)
 
+					q.recordAbortLocked(id, taskID)
+
 					task.AssignedTo = ""
 					task.AssignedAt = time.Time{}
 					q.pendingTasks = append(q.pendingTasks, task)
 
+					attempts := task.Attempts
 					if m, ok := q.missions[task.MissionID]; ok {
 						for i := range m.Subtasks {
 							if m.Subtasks[i].ID == task.ID {
 								m.Subtasks[i].Status = "pending"
 								m.Subtasks[i].AssignedTo = ""
+								attempts = m.Subtasks[i].Attempts
 								break
 							}
 						}
 					}
+					q.appendEvent(QueueEvent{
+						Type:      "task_requeued",
+						Time:      now,
+						TaskID:    taskID,
+						MissionID: task.MissionID,
+						Attempts:  attempts,
+					})
 					requeuedCount++
 					log.Printf("[mesh] requeued in-flight task %s from dead worker %s", taskID, id)
 				}
@@ -904,6 +1018,9 @@ func (q *Queue) replay() {
 					}
 				}
 				if m, ok := q.missions[ev.MissionID]; ok {
+					if m.Status == "pending" {
+						m.Status = "in_progress"
+					}
 					for i := range m.Subtasks {
 						if m.Subtasks[i].ID == ev.TaskID {
 							m.Subtasks[i].Attempts++
@@ -932,6 +1049,37 @@ func (q *Queue) replay() {
 							m.Subtasks[i].CompletedAt = ev.Time
 							break
 						}
+					}
+				}
+			}
+		case "task_requeued":
+			delete(q.inFlightTasks, ev.TaskID)
+			if t, ok := q.tasks[ev.TaskID]; ok {
+				t.AssignedTo = ""
+				t.AssignedAt = time.Time{}
+				if ev.Attempts > 0 {
+					t.Attempts = ev.Attempts
+				}
+				inPending := false
+				for _, pt := range q.pendingTasks {
+					if pt.ID == ev.TaskID {
+						inPending = true
+						break
+					}
+				}
+				if !inPending {
+					q.pendingTasks = append(q.pendingTasks, t)
+				}
+			}
+			if m, ok := q.missions[ev.MissionID]; ok {
+				for i := range m.Subtasks {
+					if m.Subtasks[i].ID == ev.TaskID {
+						m.Subtasks[i].Status = "pending"
+						m.Subtasks[i].AssignedTo = ""
+						if ev.Attempts > 0 {
+							m.Subtasks[i].Attempts = ev.Attempts
+						}
+						break
 					}
 				}
 			}
@@ -971,6 +1119,10 @@ func (q *Queue) replay() {
 		}
 	}
 	q.inFlightTasks = make(map[string]*Task)
+	now := time.Now()
+	for _, m := range q.missions {
+		q.checkMissionCompletionLocked(m, now)
+	}
 	log.Printf("[mesh] replay restored %d missions, %d pending tasks", len(q.missions), len(q.pendingTasks))
 }
 

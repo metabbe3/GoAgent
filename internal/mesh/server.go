@@ -206,7 +206,11 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		}
 		m, err := s.queue.AddMission(p.Mission, p.Subtasks)
 		if err != nil {
-			writeRPCError(w, req.ID, -32000, err.Error())
+			code := -32000
+			if strings.Contains(err.Error(), "mesh queue full") {
+				code = -32005
+			}
+			writeRPCError(w, req.ID, code, err.Error())
 			return
 		}
 		writeRPCSuccess(w, req.ID, m)
@@ -251,7 +255,11 @@ func (s *Server) handleNextTask(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(task)
+	if err := json.NewEncoder(w).Encode(task); err != nil {
+		// Client disconnected mid-dispatch: put the task back so another worker can take it.
+		log.Printf("[mesh] dispatch write failed (worker gone?): %v — requeueing task %s", err, task.ID)
+		s.queue.RequeueOnDispatchFailure(task.ID)
+	}
 }
 
 func (s *Server) sweeperLoop() {
