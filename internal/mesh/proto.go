@@ -6,13 +6,16 @@ import (
 )
 
 const (
-	HeaderMeshToken = "X-Mesh-Token"
-	HeaderMeshProto = "X-Mesh-Proto"
-	ProtoVersion    = "1"
-	MeshProtocol    = "GoMesh/1.0"
-	DefaultPollSec  = 50
-	HeartbeatSec    = 30
-	DeadTimeoutSec  = 90
+	HeaderMeshToken       = "X-Mesh-Token"
+	HeaderMeshProto       = "X-Mesh-Proto"
+	ProtoVersion          = "1"
+	MeshMajor             = 1
+	MeshMinor             = 1
+	MeshProtocol          = "GoMesh/1.1"
+	DefaultPollSec        = 50
+	HeartbeatSec          = 30
+	DeadTimeoutSec        = 90
+	DefaultTaskTimeoutSec = 300
 )
 
 // RPCRequest represents a JSON-RPC 2.0 request.
@@ -43,6 +46,10 @@ type RegisterReq struct {
 		ID           string   `json:"id"`
 		Capabilities []string `json:"capabilities"`
 	} `json:"worker"`
+	// KnownTasks lets a RE-registering worker ask which of its in-flight
+	// tasks the leader still tracks. Anything not tracked comes back in
+	// RegisterResp.LostTasks (leader-restart duplicate-work guard).
+	KnownTasks []string `json:"known_tasks,omitempty"`
 }
 
 // RegisterResp result for mesh.register.
@@ -50,6 +57,11 @@ type RegisterResp struct {
 	WorkerID     string `json:"worker_id"`
 	HeartbeatSec int    `json:"heartbeat_sec"`
 	Poll         string `json:"poll"`
+	// LostTasks lists task IDs this worker still believes it owns that the
+	// leader no longer tracks (requeued to someone else or completed after a
+	// leader restart). The worker must abort local execution of these
+	// instead of reporting into the void (GoMesh/1.1 gap fix).
+	LostTasks []string `json:"lost_tasks,omitempty"`
 }
 
 // HeartbeatReq parameters for mesh.heartbeat.
@@ -59,9 +71,13 @@ type HeartbeatReq struct {
 
 // HeartbeatResp result for mesh.heartbeat.
 type HeartbeatResp struct {
-	OK           bool `json:"ok"`
-	TasksPending int  `json:"tasks_pending"`
+	OK           bool     `json:"ok"`
+	TasksPending int      `json:"tasks_pending"`
+	AbortTasks   []string `json:"abort_tasks,omitempty"`
 }
+
+// HeartbeatResult alias for HeartbeatResp.
+type HeartbeatResult = HeartbeatResp
 
 // ReportMetrics captures task execution metrics.
 type ReportMetrics struct {
@@ -104,6 +120,8 @@ type Task struct {
 	TimeoutSec int       `json:"timeout_sec,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
 	AssignedTo string    `json:"assigned_to,omitempty"`
+	AssignedAt time.Time `json:"assigned_at,omitempty"`
+	Attempts   int       `json:"attempts,omitempty"`
 }
 
 // SubtaskState tracks subtask progress inside a mission.
@@ -114,6 +132,7 @@ type SubtaskState struct {
 	Capability  string        `json:"capability,omitempty"`
 	AssignedTo  string        `json:"assigned_to,omitempty"`
 	Status      string        `json:"status"` // "pending", "in_flight", "completed", "failed", "cancelled"
+	Attempts    int           `json:"attempts"`
 	Result      string        `json:"result,omitempty"`
 	Error       string        `json:"error,omitempty"`
 	Metrics     ReportMetrics `json:"metrics,omitempty"`
@@ -129,4 +148,8 @@ type MissionState struct {
 	Subtasks    []SubtaskState `json:"subtasks"`
 	CreatedAt   time.Time      `json:"created_at"`
 	CompletedAt time.Time      `json:"completed_at,omitempty"`
+	// FinalResult stores the leader's synthesized answer so it survives a
+	// leader restart (event-sourced): without it a crash between synthesis
+	// and delivery lost the answer forever (GoMesh/1.1 gap fix).
+	FinalResult string `json:"final_result,omitempty"`
 }

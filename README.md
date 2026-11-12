@@ -1,4 +1,4 @@
-# GoAgent v0.3 "GoMesh"
+# GoAgent v0.4 "GoMesh Reliability"
 
 GoAgent is an open-source, universal agent template built in pure Go with zero external dependencies. It combines Hermes-grade log intelligence, self-learning pattern clustering, multi-tier security guardrails, and the **GoMesh** distributed leader/worker orchestration protocol.
 
@@ -9,7 +9,7 @@ GoAgent operates in three modes:
 
 ---
 
-## Mesh Mode (GoMesh/1.0)
+## Mesh Mode (GoMesh/1.1)
 
 GoMesh is an HTTP/1.1 JSON-RPC 2.0 orchestration protocol with constant-time token authentication (`X-Mesh-Token`), capability-based routing, long-poll task delivery, and persistent JSONL state replay.
 
@@ -51,19 +51,33 @@ GOAGENT_ROLE=worker GOAGENT_LEADER_ADDR=http://127.0.0.1:7801 GOAGENT_MESH_TOKEN
 ```
 
 ### Protocol Summary
-- **Auth**: Constant-time token comparison via `X-Mesh-Token`, protocol version via `X-Mesh-Proto: 1`.
+- **Auth**: Constant-time token comparison via `X-Mesh-Token`, protocol version via `X-Mesh-Proto: 1` (`GoMesh/1.1`).
 - **Leader RPC (`POST /rpc`)**:
-  - `mesh.register`: Registers worker ID and capabilities (`heartbeat_sec: 30`, poll endpoint `/nexttask`).
-  - `mesh.heartbeat`: Worker liveness heartbeat; returns pending task count.
+  - `mesh.register`: Registers worker ID and capabilities (`heartbeat_sec: 30`, poll endpoint `/nexttask`). Re-registering workers may include `known_tasks` (IDs they still execute); the response's `lost_tasks` lists those the leader no longer tracks as theirs — abort them locally (leader-restart duplicate-work guard).
+  - `mesh.heartbeat`: Worker liveness heartbeat; returns pending task count and `abort_tasks` list (leader-ordered aborts for timed-out or cancelled work).
+  - `mesh.add_mission`: Enqueue a mission directly via JSON-RPC with 1..50 subtasks.
   - `mesh.report`: Worker reports subtask completion or failure with execution metrics. Outputs are automatically sanitized by guardrails before transmission.
+  - `mesh.get_mission_result`: Returns a mission's persisted final answer (`final_result`) and status — the recovery path after a leader restart.
 - **Task Dequeue (`GET /nexttask?id=<worker_id>`)**:
   - Long-poll holding up to 50 seconds.
   - Returns HTTP 200 with task payload when matching task arrives.
   - Returns HTTP 204 No Content on poll timeout.
 - **Liveness & Requeue**:
   - Leader sweeps workers every 15 seconds. If a worker misses 3 heartbeats (>90 seconds), it is marked dead and its in-flight tasks are automatically requeued.
+  - In-flight tasks exceeding deadline are swept, aborted, and retried or failed.
   - Unfinished missions exceeding `GOAGENT_MISSION_TIMEOUT` (default 1800s) are safely cancelled.
-- **Crash Recovery**: All mission and task transitions append to `data/mesh/state.jsonl` and replay automatically on reboot.
+- **Crash Recovery**: All mission and task transitions append to `data/mesh/state.jsonl` (event-sourcing, append-only, synchronous write before ack) and replay automatically on reboot. Any task that was in-flight when the leader died is restored to `pending` and re-dispatched — no task is lost.
+
+### Reliability
+
+GoMesh 1.1 includes multi-tier reliability mechanisms for resilient distributed execution:
+
+- **Task Deadlines & Requeuing**: Every in-flight task is tracked with `AssignedAt`. If execution exceeds `GOAGENT_TASK_TIMEOUT` (or per-subtask `timeout_sec`), the leader sweeps the task from in-flight, notifies the worker to abort, and requeues it if attempts remain (`Attempts < GOAGENT_SUBTASK_ATTEMPTS`).
+- **Abort Protocol via Heartbeat**: Leader returns `abort_tasks` in `mesh.heartbeat` responses when tasks time out or missions are cancelled. Workers maintain local execution cancel functions and abort running routines immediately, reporting `aborted by leader` to synchronize cluster state.
+- **Subtask Retries**: Transient failures (network drops, LLM resets) automatically trigger subtask retries up to `GOAGENT_SUBTASK_ATTEMPTS` (default 2). Non-retryable errors (`aborted`, `no RunFunc`) fail immediately.
+- **Auto-Fanout**: If a worker hits iteration budget exhaustion (`iteration budget`, `max iterations`), it invokes goal decomposition planning to split the workload into up to `GOAGENT_FANOUT_MAX` independent parallel sub-agents with divided deadlines. Recursion guards ensure sub-runs cannot trigger secondary fanouts.
+- **Leader-Restart Claim Check**: When a worker re-registers (leader was down/restarted), it sends `known_tasks` — the task IDs it is still executing. The leader answers with `lost_tasks`: claimed tasks its replay no longer tracks as that worker's in-flight work (already requeued elsewhere). The worker aborts those locally, eliminating duplicate runs after a leader restart.
+- **Mission Result Durability**: The leader's final synthesized answer is persisted onto the mission via the `set_mission_result` tool (and `mission_result` events in the log). A leader crash between synthesis and delivery no longer loses the answer — `mesh.get_mission_result` returns it after restart.
 
 ---
 
@@ -81,6 +95,8 @@ Settings are loaded from `goagent.env` or system environment variables:
 | `GOAGENT_CAPABILITIES`| *(empty)* | Worker | Comma-separated capability tags (e.g. `logs,files,shell`). |
 | `GOAGENT_TASK_TIMEOUT`| `300s` | Leader | Maximum time permitted for a single subtask execution. |
 | `GOAGENT_MISSION_TIMEOUT`| `1800s` | Leader | Maximum total lifecycle for a distributed mission. |
+| `GOAGENT_SUBTASK_ATTEMPTS`| `2` | Leader | Maximum execution attempts per subtask before marking failed. |
+| `GOAGENT_FANOUT_MAX` | `3` | Worker | Maximum parallel sub-agents spawned on iteration budget exhaustion (0 = off). |
 | `TELEGRAM_TOKEN` | *(empty)* | Solo / Dual | Telegram Bot API token. Required in solo mode; optional in leader/worker. |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | All | OpenAI-compatible endpoint URL. |
 | `LLM_API_KEY` | *(empty)* | All | API key for the LLM provider. |
@@ -126,6 +142,7 @@ GoAgent includes built-in tools implemented strictly with the Go standard librar
 | `mission_status` | Returns complete status and state tree for a mission. |
 | `cancel_mission` | Cancels pending and in-flight subtasks for a mission. |
 | `collect_results` | Aggregates completed subtask outputs for leader synthesis. |
+| `set_mission_result` | Persists the final synthesized answer for a mission to survive leader restarts. |
 | `mesh_info` | Displays cluster configuration and active task counts. |
 
 ---

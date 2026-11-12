@@ -18,7 +18,7 @@ import (
 	"github.com/metabbe3/GoAgent/internal/tools"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 func main() {
 	log.Printf("Starting GoAgent v%s (GoMesh orchestration)...", version)
@@ -65,7 +65,7 @@ func main() {
 			log.Fatalf("[mesh] GOAGENT_MESH_TOKEN is required for leader mode")
 		}
 		log.Printf("[mesh] starting GoAgent in LEADER mode on %s...", cfg.MeshListen)
-		queue := mesh.NewQueue("data", cfg.TaskTimeout, cfg.MissionTimeout)
+		queue := mesh.NewQueue("data", cfg.TaskTimeout, cfg.MissionTimeout, cfg.SubtaskAttempts)
 		server := mesh.NewServer(cfg.MeshListen, cfg.MeshToken, queue)
 
 		// Register leader orchestration tools for LLM
@@ -105,6 +105,19 @@ func main() {
 		}
 
 		client := mesh.NewClient(cfg.LeaderAddr, cfg.MeshToken, cfg.WorkerID, cfg.Capabilities, runFunc)
+		client.SetFanoutMax(cfg.FanoutMax)
+		if cfg.FanoutMax > 0 {
+			client.SetPlanFunc(func(planCtx context.Context, goal string) (string, error) {
+				prompt := fmt.Sprintf("Split this goal into at most %d independent sub-goals. Reply with ONE JSON array of strings only.\n\nGoal: %s", cfg.FanoutMax, goal)
+				msg, err := llmClient.ChatCompletion(planCtx, []llm.ChatMessage{
+					{Role: "user", Content: prompt},
+				}, nil)
+				if err != nil {
+					return "", err
+				}
+				return msg.Content, nil
+			})
+		}
 		defer client.Stop()
 
 		go func() {

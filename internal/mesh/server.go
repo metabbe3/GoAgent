@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -81,7 +82,13 @@ func (s *Server) Addr() string {
 func (s *Server) Stop(ctx context.Context) error {
 	close(s.stopChan)
 	if s.server != nil {
-		return s.server.Shutdown(ctx)
+		stopCtx := ctx
+		if _, ok := ctx.Deadline(); !ok {
+			var cancel context.CancelFunc
+			stopCtx, cancel = context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+		}
+		return s.server.Shutdown(stopCtx)
 	}
 	return nil
 }
@@ -132,6 +139,15 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 			HeartbeatSec: HeartbeatSec,
 			Poll:         "/nexttask",
 		}
+		// Leader-restart claim check: report which of the worker's claimed
+		// tasks this (possibly restarted) leader no longer tracks as its
+		// in-flight work — the replay already requeued them elsewhere.
+		if len(p.KnownTasks) > 0 {
+			resp.LostTasks = s.queue.LostTasks(p.Worker.ID, p.KnownTasks)
+			if len(resp.LostTasks) > 0 {
+				log.Printf("[mesh] register: worker %s claimed %d task(s) this leader no longer tracks", p.Worker.ID, len(resp.LostTasks))
+			}
+		}
 		writeRPCSuccess(w, req.ID, resp)
 
 	case "mesh.heartbeat":
@@ -145,11 +161,55 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 			writeRPCError(w, req.ID, -32000, err.Error())
 			return
 		}
+		abortTasks := s.queue.TasksToAbort(p.WorkerID)
 		resp := HeartbeatResp{
 			OK:           true,
 			TasksPending: pending,
+			AbortTasks:   abortTasks,
 		}
 		writeRPCSuccess(w, req.ID, resp)
+
+	case "mesh.get_mission_result":
+		var p struct {
+			MissionID string `json:"mission_id"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil || p.MissionID == "" {
+			writeRPCError(w, req.ID, -32602, "invalid params for mesh.get_mission_result")
+			return
+		}
+		st, err := s.queue.MissionStatus(p.MissionID)
+		if err != nil {
+			writeRPCError(w, req.ID, -32000, err.Error())
+			return
+		}
+		writeRPCSuccess(w, req.ID, map[string]any{"mission_id": st.ID, "status": st.Status, "final_result": st.FinalResult})
+
+	case "mesh.add_mission":
+		var p struct {
+			Mission  string         `json:"mission"`
+			Subtasks []SubtaskInput `json:"subtasks"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			writeRPCError(w, req.ID, -32602, "invalid params for mesh.add_mission")
+			return
+		}
+		p.Mission = strings.TrimSpace(p.Mission)
+		if p.Mission == "" || len(p.Subtasks) < 1 || len(p.Subtasks) > 50 {
+			writeRPCError(w, req.ID, -32602, "invalid params: mission must be non-empty and specify 1..50 subtasks")
+			return
+		}
+		for _, st := range p.Subtasks {
+			if strings.TrimSpace(st.Goal) == "" {
+				writeRPCError(w, req.ID, -32602, "invalid params: subtask goal cannot be empty")
+				return
+			}
+		}
+		m, err := s.queue.AddMission(p.Mission, p.Subtasks)
+		if err != nil {
+			writeRPCError(w, req.ID, -32000, err.Error())
+			return
+		}
+		writeRPCSuccess(w, req.ID, m)
 
 	case "mesh.report":
 		var p ReportReq
@@ -182,8 +242,8 @@ func (s *Server) handleNextTask(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set(HeaderMeshProto, ProtoVersion)
 
-	// Long poll up to 50 seconds
-	task, err := s.queue.GetNextTask(workerID, DefaultPollSec*time.Second)
+	// Long poll up to 50 seconds (respecting request context for immediate unblocking on client close or shutdown)
+	task, err := s.queue.GetNextTaskContext(r.Context(), workerID, DefaultPollSec*time.Second)
 	if err != nil || task == nil {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -203,6 +263,7 @@ func (s *Server) sweeperLoop() {
 		case <-s.stopChan:
 			return
 		case <-ticker.C:
+			s.queue.SweepTaskTimeouts()
 			s.queue.SweepDeadWorkers(DeadTimeoutSec * time.Second)
 			s.queue.SweepMissionTimeouts()
 		}

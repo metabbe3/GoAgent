@@ -1,6 +1,7 @@
 package mesh
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -38,28 +39,34 @@ type waiter struct {
 
 // Queue coordinates missions, subtasks, worker routing, and liveness.
 type Queue struct {
-	mu             sync.Mutex
-	dataDir        string
-	stateFile      string
-	workers        map[string]*WorkerInfo
-	missions       map[string]*MissionState
-	tasks          map[string]*Task
-	pendingTasks   []*Task
-	inFlightTasks  map[string]*Task
-	workerInFlight map[string]map[string]bool
-	waiters        map[string]*waiter
-	rrIndex        map[string]int
-	taskTimeout    time.Duration
-	missionTimeout time.Duration
+	mu                 sync.Mutex
+	dataDir            string
+	stateFile          string
+	workers            map[string]*WorkerInfo
+	missions           map[string]*MissionState
+	tasks              map[string]*Task
+	pendingTasks       []*Task
+	inFlightTasks      map[string]*Task
+	workerInFlight     map[string]map[string]bool
+	abortedTasks       map[string]map[string]bool
+	waiters            map[string]*waiter
+	rrIndex            map[string]int
+	taskTimeout        time.Duration
+	missionTimeout     time.Duration
+	maxSubtaskAttempts int
 }
 
-// NewQueue creates and initializes a Queue with optional state replay.
-func NewQueue(dataDir string, taskTimeout, missionTimeout time.Duration) *Queue {
+// NewQueue creates and initializes a Queue with optional state replay and retry limits.
+func NewQueue(dataDir string, taskTimeout, missionTimeout time.Duration, maxSubtaskAttempts ...int) *Queue {
 	if taskTimeout <= 0 {
 		taskTimeout = 300 * time.Second
 	}
 	if missionTimeout <= 0 {
 		missionTimeout = 1800 * time.Second
+	}
+	maxAttempts := 2
+	if len(maxSubtaskAttempts) > 0 && maxSubtaskAttempts[0] > 0 {
+		maxAttempts = maxSubtaskAttempts[0]
 	}
 
 	stateFile := ""
@@ -70,24 +77,42 @@ func NewQueue(dataDir string, taskTimeout, missionTimeout time.Duration) *Queue 
 	}
 
 	q := &Queue{
-		dataDir:        dataDir,
-		stateFile:      stateFile,
-		workers:        make(map[string]*WorkerInfo),
-		missions:       make(map[string]*MissionState),
-		tasks:          make(map[string]*Task),
-		pendingTasks:   make([]*Task, 0),
-		inFlightTasks:  make(map[string]*Task),
-		workerInFlight: make(map[string]map[string]bool),
-		waiters:        make(map[string]*waiter),
-		rrIndex:        make(map[string]int),
-		taskTimeout:    taskTimeout,
-		missionTimeout: missionTimeout,
+		dataDir:            dataDir,
+		stateFile:          stateFile,
+		workers:            make(map[string]*WorkerInfo),
+		missions:           make(map[string]*MissionState),
+		tasks:              make(map[string]*Task),
+		pendingTasks:       make([]*Task, 0),
+		inFlightTasks:      make(map[string]*Task),
+		workerInFlight:     make(map[string]map[string]bool),
+		abortedTasks:       make(map[string]map[string]bool),
+		waiters:            make(map[string]*waiter),
+		rrIndex:            make(map[string]int),
+		taskTimeout:        taskTimeout,
+		missionTimeout:     missionTimeout,
+		maxSubtaskAttempts: maxAttempts,
 	}
 
 	if stateFile != "" {
 		q.replay()
 	}
 	return q
+}
+
+// SetMaxSubtaskAttempts configures maximum execution attempts per subtask.
+func (q *Queue) SetMaxSubtaskAttempts(max int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if max > 0 {
+		q.maxSubtaskAttempts = max
+	}
+}
+
+// MaxSubtaskAttempts returns the configured maximum execution attempts.
+func (q *Queue) MaxSubtaskAttempts() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.maxSubtaskAttempts
 }
 
 // RegisterWorker records or updates a worker in the cluster registry.
@@ -211,6 +236,11 @@ func (q *Queue) AddMission(text string, subtasks []SubtaskInput) (*MissionState,
 
 // GetNextTask retrieves the next matching task for a worker, or blocks until maxWait.
 func (q *Queue) GetNextTask(workerID string, maxWait time.Duration) (*Task, error) {
+	return q.GetNextTaskContext(context.Background(), workerID, maxWait)
+}
+
+// GetNextTaskContext retrieves the next matching task for a worker, or blocks until maxWait or ctx cancellation.
+func (q *Queue) GetNextTaskContext(ctx context.Context, workerID string, maxWait time.Duration) (*Task, error) {
 	q.mu.Lock()
 	w, ok := q.workers[workerID]
 	if !ok {
@@ -240,10 +270,21 @@ func (q *Queue) GetNextTask(workerID string, maxWait time.Duration) (*Task, erro
 	}
 	q.mu.Unlock()
 
-	// Wait on channel or timeout
+	// Wait on channel, ctx cancellation, or timeout
 	select {
 	case task := <-waitCh:
 		return task, nil
+	case <-ctx.Done():
+		q.mu.Lock()
+		select {
+		case task := <-waitCh:
+			q.mu.Unlock()
+			return task, nil
+		default:
+		}
+		delete(q.waiters, workerID)
+		q.mu.Unlock()
+		return nil, ctx.Err()
 	case <-time.After(maxWait):
 		q.mu.Lock()
 		select {
@@ -271,7 +312,9 @@ func (q *Queue) claimPendingTaskForWorkerLocked(w *WorkerInfo) *Task {
 }
 
 func (q *Queue) assignTaskLocked(task *Task, workerID string) {
+	now := time.Now()
 	task.AssignedTo = workerID
+	task.AssignedAt = now
 	q.inFlightTasks[task.ID] = task
 
 	if q.workerInFlight[workerID] == nil {
@@ -289,6 +332,9 @@ func (q *Queue) assignTaskLocked(task *Task, workerID string) {
 		}
 		for i := range m.Subtasks {
 			if m.Subtasks[i].ID == task.ID {
+				// Increment Attempts count on task assignment to track execution attempts.
+				m.Subtasks[i].Attempts++
+				task.Attempts = m.Subtasks[i].Attempts
 				m.Subtasks[i].Status = "in_flight"
 				m.Subtasks[i].AssignedTo = workerID
 				break
@@ -298,7 +344,7 @@ func (q *Queue) assignTaskLocked(task *Task, workerID string) {
 
 	q.appendEvent(QueueEvent{
 		Type:      "task_assigned",
-		Time:      time.Now(),
+		Time:      now,
 		TaskID:    task.ID,
 		MissionID: task.MissionID,
 		WorkerID:  workerID,
@@ -344,7 +390,7 @@ func (q *Queue) ReportTask(req ReportReq) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	_, ok := q.inFlightTasks[req.TaskID]
+	task, ok := q.inFlightTasks[req.TaskID]
 	if !ok {
 		// Task might have already timed out or completed
 		log.Printf("[mesh] ignoring report for untracked task %s from worker %s", req.TaskID, req.WorkerID)
@@ -360,43 +406,52 @@ func (q *Queue) ReportTask(req ReportReq) error {
 	}
 
 	now := time.Now()
+	var requeued bool
+
 	if m, ok := q.missions[req.MissionID]; ok {
 		for i := range m.Subtasks {
 			if m.Subtasks[i].ID == req.TaskID {
 				if req.Success {
 					m.Subtasks[i].Status = "completed"
+					m.Subtasks[i].Result = req.Result
+					m.Subtasks[i].Error = ""
+					m.Subtasks[i].Metrics = req.Metrics
+					m.Subtasks[i].CompletedAt = now
 				} else {
-					m.Subtasks[i].Status = "failed"
+					// Check retry eligibility:
+					// Non-retryable if mission cancelled, error starts with "aborted" or "no RunFunc",
+					// or Attempts >= maxSubtaskAttempts.
+					isAborted := strings.HasPrefix(req.Error, "aborted") || req.Error == "aborted by leader"
+					isNoRunFunc := strings.HasPrefix(req.Error, "no RunFunc")
+					isCancelled := m.Status == "cancelled"
+
+					if !isCancelled && !isAborted && !isNoRunFunc && m.Subtasks[i].Attempts < q.maxSubtaskAttempts {
+						// Requeue subtask for retry.
+						// Attempts was incremented upon assignment, so it retains its attempt count.
+						m.Subtasks[i].Status = "pending"
+						m.Subtasks[i].AssignedTo = ""
+						m.Subtasks[i].Error = req.Error
+						m.Subtasks[i].Metrics = req.Metrics
+
+						task.AssignedTo = ""
+						task.AssignedAt = time.Time{}
+						q.pendingTasks = append(q.pendingTasks, task)
+						requeued = true
+						log.Printf("[mesh] task %s failed (%s), requeued (attempt %d/%d)", req.TaskID, req.Error, m.Subtasks[i].Attempts, q.maxSubtaskAttempts)
+					} else {
+						m.Subtasks[i].Status = "failed"
+						m.Subtasks[i].Result = req.Result
+						m.Subtasks[i].Error = req.Error
+						m.Subtasks[i].Metrics = req.Metrics
+						m.Subtasks[i].CompletedAt = now
+						log.Printf("[mesh] task %s marked failed on worker %s: %s (attempts: %d/%d)", req.TaskID, req.WorkerID, req.Error, m.Subtasks[i].Attempts, q.maxSubtaskAttempts)
+					}
 				}
-				m.Subtasks[i].Result = req.Result
-				m.Subtasks[i].Error = req.Error
-				m.Subtasks[i].Metrics = req.Metrics
-				m.Subtasks[i].CompletedAt = now
 				break
 			}
 		}
 
-		// Check if all subtasks in this mission finished
-		allDone := true
-		anyFailed := false
-		for _, st := range m.Subtasks {
-			if st.Status == "pending" || st.Status == "in_flight" {
-				allDone = false
-				break
-			}
-			if st.Status == "failed" {
-				anyFailed = true
-			}
-		}
-		if allDone {
-			if anyFailed {
-				m.Status = "failed"
-			} else {
-				m.Status = "completed"
-			}
-			m.CompletedAt = now
-			log.Printf("[mesh] mission %s %s", m.ID, m.Status)
-		}
+		q.checkMissionCompletionLocked(m, now)
 	}
 
 	q.appendEvent(QueueEvent{
@@ -410,8 +465,33 @@ func (q *Queue) ReportTask(req ReportReq) error {
 	log.Printf("[mesh] task %s reported by %s: success=%v", req.TaskID, req.WorkerID, req.Success)
 
 	// Dispatch remaining pending tasks if waiters are ready
-	q.dispatchPendingLocked()
+	if requeued {
+		q.dispatchPendingLocked()
+	}
 	return nil
+}
+
+func (q *Queue) checkMissionCompletionLocked(m *MissionState, now time.Time) {
+	allDone := true
+	anyFailed := false
+	for _, st := range m.Subtasks {
+		if st.Status == "pending" || st.Status == "in_flight" {
+			allDone = false
+			break
+		}
+		if st.Status == "failed" {
+			anyFailed = true
+		}
+	}
+	if allDone {
+		if anyFailed {
+			m.Status = "failed"
+		} else {
+			m.Status = "completed"
+		}
+		m.CompletedAt = now
+		log.Printf("[mesh] mission %s %s", m.ID, m.Status)
+	}
 }
 
 // CancelMission cancels an active or pending mission.
@@ -440,9 +520,12 @@ func (q *Queue) CancelMission(missionID string) error {
 	}
 	q.pendingTasks = kept
 
-	// Mark subtasks cancelled
+	// Mark subtasks cancelled and record aborts for in-flight tasks
 	for i := range m.Subtasks {
 		if m.Subtasks[i].Status == "pending" || m.Subtasks[i].Status == "in_flight" {
+			if m.Subtasks[i].Status == "in_flight" && m.Subtasks[i].AssignedTo != "" {
+				q.recordAbortLocked(m.Subtasks[i].AssignedTo, m.Subtasks[i].ID)
+			}
 			m.Subtasks[i].Status = "cancelled"
 			m.Subtasks[i].CompletedAt = now
 		}
@@ -471,6 +554,27 @@ func (q *Queue) MissionStatus(missionID string) (*MissionState, error) {
 	return &mCopy, nil
 }
 
+// SetMissionResult persists the leader's final synthesized answer onto the
+// mission (and into the event log) so a leader restart between synthesis
+// and delivery does not lose it.
+func (q *Queue) SetMissionResult(missionID, result string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	m, ok := q.missions[missionID]
+	if !ok {
+		return fmt.Errorf("mission %s not found", missionID)
+	}
+	m.FinalResult = result
+	q.appendEvent(QueueEvent{
+		Type:      "mission_result",
+		Time:      time.Now(),
+		MissionID: missionID,
+		Report:    &ReportReq{Result: result},
+	})
+	return nil
+}
+
 // CollectResults combines completed subtask results for a mission.
 func (q *Queue) CollectResults(missionID string) (string, error) {
 	q.mu.Lock()
@@ -495,6 +599,158 @@ func (q *Queue) CollectResults(missionID string) (string, error) {
 		sb.WriteString("\n")
 	}
 	return strings.TrimSpace(sb.String()), nil
+}
+
+func (q *Queue) recordAbortLocked(workerID, taskID string) {
+	if workerID == "" || taskID == "" {
+		return
+	}
+	if q.abortedTasks[workerID] == nil {
+		q.abortedTasks[workerID] = make(map[string]bool)
+	}
+	q.abortedTasks[workerID][taskID] = true
+}
+
+// TasksToAbort returns all task IDs that should be aborted by workerID
+// (deadline exceeded, mission cancelled, or requeued).
+func (q *Queue) TasksToAbort(workerID string) []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	abortSet := make(map[string]bool)
+
+	// 1. Any recorded aborts from sweeps or cancellations
+	if recorded, ok := q.abortedTasks[workerID]; ok {
+		for id := range recorded {
+			abortSet[id] = true
+		}
+		delete(q.abortedTasks, workerID)
+	}
+
+	// 2. Any currently in-flight tasks for this worker that have timed out or belong to cancelled missions
+	now := time.Now()
+	if inflight, ok := q.workerInFlight[workerID]; ok {
+		for taskID := range inflight {
+			task, exists := q.inFlightTasks[taskID]
+			if !exists || task == nil {
+				abortSet[taskID] = true
+				continue
+			}
+			if !task.AssignedAt.IsZero() && now.Sub(task.AssignedAt) > q.taskTimeout {
+				abortSet[taskID] = true
+				continue
+			}
+			if m, mOk := q.missions[task.MissionID]; mOk && m.Status == "cancelled" {
+				abortSet[taskID] = true
+				continue
+			}
+		}
+	}
+
+	var result []string
+	for id := range abortSet {
+		result = append(result, id)
+	}
+	return result
+}
+
+// LostTasks returns which of the worker's claimed task IDs this leader no
+// longer tracks as that worker's in-flight work (used at re-registration
+// after a leader restart — replay requeued such tasks to other workers, so
+// the old worker should abort its duplicate run).
+func (q *Queue) LostTasks(workerID string, claimed []string) []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	var lost []string
+	if inflight, ok := q.workerInFlight[workerID]; ok {
+		for _, id := range claimed {
+			if !inflight[id] {
+				lost = append(lost, id)
+			}
+		}
+	} else {
+		lost = append(lost, claimed...) // no tracked work at all: everything is lost
+	}
+	return lost
+}
+
+// SweepTaskTimeouts detects in-flight tasks exceeding taskTimeout, requeues them if attempts remain, or fails them.
+func (q *Queue) SweepTaskTimeouts() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	now := time.Now()
+	timedOutCount := 0
+	var requeuedAny bool
+
+	for taskID, task := range q.inFlightTasks {
+		if !task.AssignedAt.IsZero() && now.Sub(task.AssignedAt) > q.taskTimeout {
+			timedOutCount++
+			workerID := task.AssignedTo
+
+			// Remove from in-flight and worker tracking
+			delete(q.inFlightTasks, taskID)
+			if inflight, ok := q.workerInFlight[workerID]; ok {
+				delete(inflight, taskID)
+			}
+			if w, ok := q.workers[workerID]; ok {
+				w.InFlight = len(q.workerInFlight[workerID])
+			}
+
+			// Record for heartbeat abort so worker stops execution if still running
+			q.recordAbortLocked(workerID, taskID)
+
+			// Check attempts
+			m, mOk := q.missions[task.MissionID]
+			subtaskIdx := -1
+			if mOk {
+				for i := range m.Subtasks {
+					if m.Subtasks[i].ID == taskID {
+						subtaskIdx = i
+						break
+					}
+				}
+			}
+
+			attempts := task.Attempts
+			if subtaskIdx >= 0 {
+				attempts = m.Subtasks[subtaskIdx].Attempts
+			}
+
+			if attempts < q.maxSubtaskAttempts {
+				// Requeue
+				task.AssignedTo = ""
+				task.AssignedAt = time.Time{}
+				q.pendingTasks = append(q.pendingTasks, task)
+				requeuedAny = true
+
+				if subtaskIdx >= 0 {
+					m.Subtasks[subtaskIdx].Status = "pending"
+					m.Subtasks[subtaskIdx].AssignedTo = ""
+				}
+				log.Printf("[mesh] task %s timed out on %s, requeued (attempt %d/%d)", taskID, workerID, attempts, q.maxSubtaskAttempts)
+			} else {
+				// Failed
+				if subtaskIdx >= 0 {
+					m.Subtasks[subtaskIdx].Status = "failed"
+					m.Subtasks[subtaskIdx].Error = fmt.Sprintf("task timed out after %ds", int(q.taskTimeout.Seconds()))
+					m.Subtasks[subtaskIdx].CompletedAt = now
+				}
+				log.Printf("[mesh] task %s timed out on %s, marked failed (attempts exhausted %d/%d)", taskID, workerID, attempts, q.maxSubtaskAttempts)
+
+				// Update mission status if all subtasks finished
+				if mOk {
+					q.checkMissionCompletionLocked(m, now)
+				}
+			}
+		}
+	}
+
+	if requeuedAny {
+		q.dispatchPendingLocked()
+	}
+	return timedOutCount
 }
 
 // SweepDeadWorkers detects workers with 3 missed heartbeats (>deadTimeout) and requeues in-flight tasks.
@@ -523,6 +779,7 @@ func (q *Queue) SweepDeadWorkers(deadTimeout time.Duration) int {
 					delete(inflight, taskID)
 
 					task.AssignedTo = ""
+					task.AssignedAt = time.Time{}
 					q.pendingTasks = append(q.pendingTasks, task)
 
 					if m, ok := q.missions[task.MissionID]; ok {
@@ -637,6 +894,7 @@ func (q *Queue) replay() {
 		case "task_assigned":
 			if t, ok := q.tasks[ev.TaskID]; ok {
 				t.AssignedTo = ev.WorkerID
+				t.AssignedAt = ev.Time
 				q.inFlightTasks[t.ID] = t
 				// Remove from pending
 				for i, pt := range q.pendingTasks {
@@ -648,6 +906,8 @@ func (q *Queue) replay() {
 				if m, ok := q.missions[ev.MissionID]; ok {
 					for i := range m.Subtasks {
 						if m.Subtasks[i].ID == ev.TaskID {
+							m.Subtasks[i].Attempts++
+							t.Attempts = m.Subtasks[i].Attempts
 							m.Subtasks[i].Status = "in_flight"
 							m.Subtasks[i].AssignedTo = ev.WorkerID
 							break
@@ -675,6 +935,10 @@ func (q *Queue) replay() {
 					}
 				}
 			}
+		case "mission_result":
+			if m, ok := q.missions[ev.MissionID]; ok && ev.Report != nil {
+				m.FinalResult = ev.Report.Result
+			}
 		case "mission_cancelled":
 			if m, ok := q.missions[ev.MissionID]; ok {
 				m.Status = "cancelled"
@@ -694,6 +958,7 @@ func (q *Queue) replay() {
 	// Any tasks that were left in-flight when server crashed are restored to pending
 	for _, t := range q.inFlightTasks {
 		t.AssignedTo = ""
+		t.AssignedAt = time.Time{}
 		q.pendingTasks = append(q.pendingTasks, t)
 		if m, ok := q.missions[t.MissionID]; ok {
 			for i := range m.Subtasks {

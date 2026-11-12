@@ -12,27 +12,29 @@ import (
 
 // Config holds all configuration values for GoAgent.
 type Config struct {
-	TelegramToken  string
-	LLMBaseURL     string
-	LLMAPIKey      string
-	LLMModel       string
-	LLMHeavyModel  string
-	LLMEmbedURL    string
-	LLMEmbedModel  string
-	AdminChatID    int64
-	AllowShell     bool
-	MaxIterations  int
-	MaskIP         bool
-	AllowedRoots   string
-	AllowEnv       bool
-	MeshRole       string // "solo", "leader", "worker"
-	MeshListen     string // leader listen address, e.g. ":7801"
-	MeshToken      string // shared authentication token
-	LeaderAddr     string // worker connection to leader
-	WorkerID       string // worker identity
-	Capabilities   []string
-	TaskTimeout    time.Duration // default 300s
-	MissionTimeout time.Duration // default 1800s
+	TelegramToken   string
+	LLMBaseURL      string
+	LLMAPIKey       string
+	LLMModel        string
+	LLMHeavyModel   string
+	LLMEmbedURL     string
+	LLMEmbedModel   string
+	AdminChatID     int64
+	AllowShell      bool
+	MaxIterations   int
+	MaskIP          bool
+	AllowedRoots    string
+	AllowEnv        bool
+	MeshRole        string // "solo", "leader", "worker"
+	MeshListen      string // leader listen address, e.g. ":7801"
+	MeshToken       string // shared authentication token
+	LeaderAddr      string // worker connection to leader
+	WorkerID        string // worker identity
+	Capabilities    []string
+	TaskTimeout     time.Duration // default 300s
+	MissionTimeout  time.Duration // default 1800s
+	SubtaskAttempts int           // default 2, GOAGENT_SUBTASK_ATTEMPTS
+	FanoutMax       int           // default 3, GOAGENT_FANOUT_MAX (0 = off)
 }
 
 // Default values
@@ -45,6 +47,8 @@ const (
 	DefaultMeshListen        = ":7801"
 	DefaultTaskTimeoutSec    = 300
 	DefaultMissionTimeoutSec = 1800
+	DefaultSubtaskAttempts   = 2
+	DefaultFanoutMax         = 3
 )
 
 // Load reads configuration from the default env file (if present)
@@ -162,6 +166,20 @@ func LoadFromFile(envPath string) (*Config, error) {
 		}
 	}
 
+	subtaskAttempts := DefaultSubtaskAttempts
+	if saStr := getVal("GOAGENT_SUBTASK_ATTEMPTS", ""); saStr != "" {
+		if s, err := strconv.Atoi(saStr); err == nil && s > 0 {
+			subtaskAttempts = s
+		}
+	}
+
+	fanoutMax := DefaultFanoutMax
+	if fmStr := getVal("GOAGENT_FANOUT_MAX", ""); fmStr != "" {
+		if s, err := strconv.Atoi(fmStr); err == nil && s >= 0 {
+			fanoutMax = s
+		}
+	}
+
 	baseURL := getVal("LLM_BASE_URL", DefaultLLMBaseURL)
 	baseURL = strings.TrimRight(baseURL, "/")
 
@@ -213,26 +231,28 @@ func LoadFromFile(envPath string) (*Config, error) {
 	}
 
 	return &Config{
-		TelegramToken:  telegramToken,
-		LLMBaseURL:     baseURL,
-		LLMAPIKey:      apiKey,
-		LLMModel:       model,
-		LLMHeavyModel:  heavyModel,
-		LLMEmbedURL:    embedURL,
-		LLMEmbedModel:  embedModel,
-		AdminChatID:    adminChatID,
-		AllowShell:     allowShell,
-		MaxIterations:  maxIter,
-		MaskIP:         maskIP,
-		AllowedRoots:   allowedRoots,
-		AllowEnv:       allowEnv,
-		MeshRole:       meshRole,
-		MeshListen:     meshListen,
-		MeshToken:      meshToken,
-		LeaderAddr:     leaderAddr,
-		WorkerID:       workerID,
-		Capabilities:   caps,
-		TaskTimeout:    taskTimeout,
-		MissionTimeout: missionTimeout,
+		TelegramToken:   telegramToken,
+		LLMBaseURL:      baseURL,
+		LLMAPIKey:       apiKey,
+		LLMModel:        model,
+		LLMHeavyModel:   heavyModel,
+		LLMEmbedURL:     embedURL,
+		LLMEmbedModel:   embedModel,
+		AdminChatID:     adminChatID,
+		AllowShell:      allowShell,
+		MaxIterations:   maxIter,
+		MaskIP:          maskIP,
+		AllowedRoots:    allowedRoots,
+		AllowEnv:        allowEnv,
+		MeshRole:        meshRole,
+		MeshListen:      meshListen,
+		MeshToken:       meshToken,
+		LeaderAddr:      leaderAddr,
+		WorkerID:        workerID,
+		Capabilities:    caps,
+		TaskTimeout:     taskTimeout,
+		MissionTimeout:  missionTimeout,
+		SubtaskAttempts: subtaskAttempts,
+		FanoutMax:       fanoutMax,
 	}, nil
 }

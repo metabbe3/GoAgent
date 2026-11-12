@@ -182,7 +182,41 @@ func RegisterLeaderTools(r *tools.Registry, s *Server) {
 		return q.CollectResults(args.MissionID)
 	})
 
-	// 6. mesh_info
+	// 6. set_mission_result — persist the leader's final synthesized answer
+	// (survives leader restarts via the event log; GoMesh/1.1 gap fix).
+	r.Register(llm.ToolDefinition{
+		Type: "function",
+		Function: llm.ToolFunctionDef{
+			Name: "set_mission_result",
+			Description: "Persist the final synthesized answer for a mission AFTER collect_results. " +
+				"Always call this once the final answer is composed, so it survives a leader restart.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"mission_id": map[string]any{"type": "string", "description": "Mission ID"},
+					"result":     map[string]any{"type": "string", "description": "The final synthesized answer text"},
+				},
+				"required": []string{"mission_id", "result"},
+			},
+		},
+	}, func(argsJSON string) (string, error) {
+		var args struct {
+			MissionID string `json:"mission_id"`
+			Result    string `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			return "", fmt.Errorf("invalid arguments: %w", err)
+		}
+		if args.MissionID == "" || strings.TrimSpace(args.Result) == "" {
+			return "", fmt.Errorf("mission_id and result are required")
+		}
+		if err := q.SetMissionResult(args.MissionID, args.Result); err != nil {
+			return "", err
+		}
+		return "Mission result persisted.", nil
+	})
+
+	// 7. mesh_info
 	r.Register(llm.ToolDefinition{
 		Type: "function",
 		Function: llm.ToolFunctionDef{

@@ -50,6 +50,36 @@ GOAGENT_MAX_ITER=12
 	if cfg.MaxIterations != 12 {
 		t.Errorf("expected MaxIterations 12, got %d", cfg.MaxIterations)
 	}
+	if cfg.SubtaskAttempts != 2 {
+		t.Errorf("expected default SubtaskAttempts 2, got %d", cfg.SubtaskAttempts)
+	}
+	if cfg.FanoutMax != 3 {
+		t.Errorf("expected default FanoutMax 3, got %d", cfg.FanoutMax)
+	}
+}
+
+func TestConfigSubtaskAttemptsAndFanout(t *testing.T) {
+	tmpDir := t.TempDir()
+	envFile := filepath.Join(tmpDir, "test.env")
+	content := `
+TELEGRAM_TOKEN=test-token
+GOAGENT_SUBTASK_ATTEMPTS=4
+GOAGENT_FANOUT_MAX=5
+`
+	if err := os.WriteFile(envFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test env: %v", err)
+	}
+
+	cfg, err := LoadFromFile(envFile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.SubtaskAttempts != 4 {
+		t.Errorf("expected SubtaskAttempts 4, got %d", cfg.SubtaskAttempts)
+	}
+	if cfg.FanoutMax != 5 {
+		t.Errorf("expected FanoutMax 5, got %d", cfg.FanoutMax)
+	}
 }
 
 func TestConfigMissingToken(t *testing.T) {
