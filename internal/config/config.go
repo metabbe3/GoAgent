@@ -7,28 +7,44 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all configuration values for GoAgent.
 type Config struct {
-	TelegramToken string
-	LLMBaseURL    string
-	LLMAPIKey     string
-	LLMModel      string
-	AdminChatID   int64
-	AllowShell    bool
-	MaxIterations int
-	MaskIP        bool
-	AllowedRoots  string
-	AllowEnv      bool
+	TelegramToken  string
+	LLMBaseURL     string
+	LLMAPIKey      string
+	LLMModel       string
+	LLMHeavyModel  string
+	LLMEmbedURL    string
+	LLMEmbedModel  string
+	AdminChatID    int64
+	AllowShell     bool
+	MaxIterations  int
+	MaskIP         bool
+	AllowedRoots   string
+	AllowEnv       bool
+	MeshRole       string // "solo", "leader", "worker"
+	MeshListen     string // leader listen address, e.g. ":7801"
+	MeshToken      string // shared authentication token
+	LeaderAddr     string // worker connection to leader
+	WorkerID       string // worker identity
+	Capabilities   []string
+	TaskTimeout    time.Duration // default 300s
+	MissionTimeout time.Duration // default 1800s
 }
 
 // Default values
 const (
-	DefaultLLMBaseURL    = "https://api.openai.com/v1"
-	DefaultLLMModel      = "gpt-4o-mini"
-	DefaultMaxIterations = 8
-	DefaultEnvFile       = "goagent.env"
+	DefaultLLMBaseURL        = "https://api.openai.com/v1"
+	DefaultLLMModel          = "gpt-4o-mini"
+	DefaultMaxIterations     = 8
+	DefaultEnvFile           = "goagent.env"
+	DefaultMeshRole          = "solo"
+	DefaultMeshListen        = ":7801"
+	DefaultTaskTimeoutSec    = 300
+	DefaultMissionTimeoutSec = 1800
 )
 
 // Load reads configuration from the default env file (if present)
@@ -89,15 +105,70 @@ func LoadFromFile(envPath string) (*Config, error) {
 		return defVal
 	}
 
+	meshRole := strings.ToLower(strings.TrimSpace(getVal("GOAGENT_ROLE", DefaultMeshRole)))
+	if meshRole == "" {
+		meshRole = DefaultMeshRole
+	}
+	meshListen := getVal("GOAGENT_MESH_LISTEN", DefaultMeshListen)
+	meshToken := getVal("GOAGENT_MESH_TOKEN", "")
+	leaderAddr := getVal("GOAGENT_LEADER_ADDR", "")
+
 	telegramToken := getVal("TELEGRAM_TOKEN", "")
-	if telegramToken == "" {
+	if meshRole == "solo" && telegramToken == "" {
 		return nil, fmt.Errorf("TELEGRAM_TOKEN is required. Please set it in %s or run './deploy.sh install'", filepath.Base(envPath))
+	}
+	if meshRole == "leader" && meshToken == "" {
+		return nil, fmt.Errorf("GOAGENT_MESH_TOKEN is required for leader")
+	}
+	if meshRole == "worker" {
+		if meshToken == "" {
+			return nil, fmt.Errorf("GOAGENT_MESH_TOKEN is required for worker")
+		}
+		if leaderAddr == "" {
+			return nil, fmt.Errorf("GOAGENT_LEADER_ADDR is required for worker")
+		}
+	}
+
+	workerID := getVal("GOAGENT_WORKER_ID", "")
+	if workerID == "" {
+		hostname, err := os.Hostname()
+		if err != nil || hostname == "" {
+			hostname = "worker"
+		}
+		workerID = fmt.Sprintf("%s-%d", hostname, os.Getpid())
+	}
+
+	var caps []string
+	if capStr := getVal("GOAGENT_CAPABILITIES", ""); capStr != "" {
+		for _, part := range strings.Split(capStr, ",") {
+			part = strings.TrimSpace(part)
+			if part != "" {
+				caps = append(caps, part)
+			}
+		}
+	}
+
+	taskTimeout := time.Duration(DefaultTaskTimeoutSec) * time.Second
+	if ttStr := getVal("GOAGENT_TASK_TIMEOUT", ""); ttStr != "" {
+		if s, err := strconv.Atoi(ttStr); err == nil && s > 0 {
+			taskTimeout = time.Duration(s) * time.Second
+		}
+	}
+
+	missionTimeout := time.Duration(DefaultMissionTimeoutSec) * time.Second
+	if mtStr := getVal("GOAGENT_MISSION_TIMEOUT", ""); mtStr != "" {
+		if s, err := strconv.Atoi(mtStr); err == nil && s > 0 {
+			missionTimeout = time.Duration(s) * time.Second
+		}
 	}
 
 	baseURL := getVal("LLM_BASE_URL", DefaultLLMBaseURL)
 	baseURL = strings.TrimRight(baseURL, "/")
 
 	model := getVal("LLM_MODEL", DefaultLLMModel)
+	heavyModel := getVal("LLM_HEAVY_MODEL", "")
+	embedURL := getVal("LLM_EMBED_URL", "")
+	embedModel := getVal("LLM_EMBED_MODEL", "")
 	apiKey := getVal("LLM_API_KEY", "")
 
 	var adminChatID int64
@@ -142,15 +213,26 @@ func LoadFromFile(envPath string) (*Config, error) {
 	}
 
 	return &Config{
-		TelegramToken: telegramToken,
-		LLMBaseURL:    baseURL,
-		LLMAPIKey:     apiKey,
-		LLMModel:      model,
-		AdminChatID:   adminChatID,
-		AllowShell:    allowShell,
-		MaxIterations: maxIter,
-		MaskIP:        maskIP,
-		AllowedRoots:  allowedRoots,
-		AllowEnv:      allowEnv,
+		TelegramToken:  telegramToken,
+		LLMBaseURL:     baseURL,
+		LLMAPIKey:      apiKey,
+		LLMModel:       model,
+		LLMHeavyModel:  heavyModel,
+		LLMEmbedURL:    embedURL,
+		LLMEmbedModel:  embedModel,
+		AdminChatID:    adminChatID,
+		AllowShell:     allowShell,
+		MaxIterations:  maxIter,
+		MaskIP:         maskIP,
+		AllowedRoots:   allowedRoots,
+		AllowEnv:       allowEnv,
+		MeshRole:       meshRole,
+		MeshListen:     meshListen,
+		MeshToken:      meshToken,
+		LeaderAddr:     leaderAddr,
+		WorkerID:       workerID,
+		Capabilities:   caps,
+		TaskTimeout:    taskTimeout,
+		MissionTimeout: missionTimeout,
 	}, nil
 }

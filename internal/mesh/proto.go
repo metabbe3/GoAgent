@@ -1,0 +1,132 @@
+package mesh
+
+import (
+	"encoding/json"
+	"time"
+)
+
+const (
+	HeaderMeshToken = "X-Mesh-Token"
+	HeaderMeshProto = "X-Mesh-Proto"
+	ProtoVersion    = "1"
+	MeshProtocol    = "GoMesh/1.0"
+	DefaultPollSec  = 50
+	HeartbeatSec    = 30
+	DeadTimeoutSec  = 90
+)
+
+// RPCRequest represents a JSON-RPC 2.0 request.
+type RPCRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      any             `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+// RPCResponse represents a JSON-RPC 2.0 response.
+type RPCResponse struct {
+	JSONRPC string    `json:"jsonrpc"`
+	ID      any       `json:"id"`
+	Result  any       `json:"result,omitempty"`
+	Error   *RPCError `json:"error,omitempty"`
+}
+
+// RPCError represents a JSON-RPC 2.0 error.
+type RPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// RegisterReq parameters for mesh.register.
+type RegisterReq struct {
+	Worker struct {
+		ID           string   `json:"id"`
+		Capabilities []string `json:"capabilities"`
+	} `json:"worker"`
+}
+
+// RegisterResp result for mesh.register.
+type RegisterResp struct {
+	WorkerID     string `json:"worker_id"`
+	HeartbeatSec int    `json:"heartbeat_sec"`
+	Poll         string `json:"poll"`
+}
+
+// HeartbeatReq parameters for mesh.heartbeat.
+type HeartbeatReq struct {
+	WorkerID string `json:"worker_id"`
+}
+
+// HeartbeatResp result for mesh.heartbeat.
+type HeartbeatResp struct {
+	OK           bool `json:"ok"`
+	TasksPending int  `json:"tasks_pending"`
+}
+
+// ReportMetrics captures task execution metrics.
+type ReportMetrics struct {
+	Iterations int   `json:"iterations"`
+	ElapsedMs  int64 `json:"elapsed_ms"`
+}
+
+// ReportReq parameters for mesh.report.
+type ReportReq struct {
+	WorkerID  string        `json:"worker_id"`
+	TaskID    string        `json:"task_id"`
+	MissionID string        `json:"mission_id"`
+	Success   bool          `json:"success"`
+	Result    string        `json:"result"`
+	Error     string        `json:"error"`
+	Metrics   ReportMetrics `json:"metrics"`
+}
+
+// ReportResp result for mesh.report.
+type ReportResp struct {
+	OK bool `json:"ok"`
+}
+
+// WorkerInfo represents a registered cluster worker.
+type WorkerInfo struct {
+	ID           string    `json:"id"`
+	Capabilities []string  `json:"capabilities"`
+	LastSeen     time.Time `json:"last_seen"`
+	InFlight     int       `json:"in_flight,omitempty"`
+	Status       string    `json:"status,omitempty"` // "active", "dead"
+}
+
+// Task represents an individual assignable unit of work.
+type Task struct {
+	ID         string    `json:"id"`
+	MissionID  string    `json:"mission_id"`
+	Goal       string    `json:"goal"`
+	Context    string    `json:"context,omitempty"`
+	Capability string    `json:"capability,omitempty"`
+	TimeoutSec int       `json:"timeout_sec,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	AssignedTo string    `json:"assigned_to,omitempty"`
+}
+
+// SubtaskState tracks subtask progress inside a mission.
+type SubtaskState struct {
+	ID          string        `json:"id"`
+	Goal        string        `json:"goal"`
+	Context     string        `json:"context,omitempty"`
+	Capability  string        `json:"capability,omitempty"`
+	AssignedTo  string        `json:"assigned_to,omitempty"`
+	Status      string        `json:"status"` // "pending", "in_flight", "completed", "failed", "cancelled"
+	Result      string        `json:"result,omitempty"`
+	Error       string        `json:"error,omitempty"`
+	Metrics     ReportMetrics `json:"metrics,omitempty"`
+	CreatedAt   time.Time     `json:"created_at"`
+	CompletedAt time.Time     `json:"completed_at,omitempty"`
+}
+
+// MissionState represents an overall high-level mission and its subtasks.
+type MissionState struct {
+	ID          string         `json:"id"`
+	Text        string         `json:"text"`
+	Status      string         `json:"status"` // "pending", "in_progress", "completed", "failed", "cancelled"
+	Subtasks    []SubtaskState `json:"subtasks"`
+	CreatedAt   time.Time      `json:"created_at"`
+	CompletedAt time.Time      `json:"completed_at,omitempty"`
+}

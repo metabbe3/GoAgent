@@ -1,156 +1,173 @@
-# GoAgent v0.2
+# GoAgent v0.3 "GoMesh"
 
-GoAgent is an open-source, general-purpose Telegram assistant built in pure Go that specializes in Hermes-grade log intelligence, self-learning pattern clustering, and system diagnostics with zero-leak guardrails. It connects OpenAI-compatible LLMs to your local environment using chunk-parallel log engines, concurrent multi-tool execution, and multi-tier security boundaries with zero external dependencies.
+GoAgent is an open-source, universal agent template built in pure Go with zero external dependencies. It combines Hermes-grade log intelligence, self-learning pattern clustering, multi-tier security guardrails, and the **GoMesh** distributed leader/worker orchestration protocol.
+
+GoAgent operates in three modes:
+1. **Solo (default)**: Autonomous local agent connected to Telegram or CLI.
+2. **Leader**: Cluster coordinator delegating subtasks across distributed workers and synthesizing results.
+3. **Worker**: Specialized node executing assigned tasks with local tools and reporting back to the leader.
 
 ---
 
-## Quick Start
+## Architecture & Mesh Mode (GoMesh/1.0)
 
-Get your bot running in 5 easy steps:
+GoMesh is an HTTP/1.1 JSON-RPC 2.0 orchestration protocol with constant-time token authentication (`X-Mesh-Token`), capability-based routing, long-poll task delivery, and persistent JSONL state replay.
 
+```
+                      +-------------------+
+                      |   GoAgent Leader  |
+                      |   (:7801 / HTTP)  |
+                      +---------+---------+
+                                |
+             +------------------+------------------+
+             | (X-Mesh-Token, RPC & /nexttask)     |
+             v                                     v
+   +--------------------+                +--------------------+
+   |   Worker 1 (logs)  |                |  Worker 2 (shell)  |
+   |  Local Tools:      |                |  Local Tools:      |
+   |  - analyze_logs    |                |  - run_command     |
+   |  - log_timeline    |                |  - read_file       |
+   |  - read_document   |                |  - generate_pdf    |
+   +--------------------+                +--------------------+
+```
+
+### Protocol Summary
+- **Auth**: Constant-time token comparison via `X-Mesh-Token`, protocol version via `X-Mesh-Proto: 1`.
+- **Leader RPC (`POST /rpc`)**:
+  - `mesh.register`: Registers worker ID and capabilities (`heartbeat_sec: 30`, poll endpoint `/nexttask`).
+  - `mesh.heartbeat`: Worker liveness heartbeat; returns pending task count.
+  - `mesh.report`: Worker reports subtask completion or failure with execution metrics. Outputs are automatically sanitized by guardrails before transmission.
+- **Task Dequeue (`GET /nexttask?id=<worker_id>`)**:
+  - Long-poll holding up to 50 seconds.
+  - Returns HTTP 200 with task payload when matching task arrives.
+  - Returns HTTP 204 No Content on poll timeout.
+- **Liveness & Requeue**:
+  - Leader sweeps workers every 15 seconds. If a worker misses 3 heartbeats (>90 seconds), it is marked dead and its in-flight tasks are automatically requeued.
+  - Unfinished missions exceeding `GOAGENT_MISSION_TIMEOUT` (default 1800s) are safely cancelled.
+- **Crash Recovery**: All mission and task transitions append to `data/mesh/state.jsonl` and replay automatically on reboot.
+
+---
+
+## Quickstart: 3-Terminal Mesh Cluster
+
+Run a full GoMesh cluster locally in 3 terminals:
+
+### Terminal 1: Mesh Leader (Coordinator)
 ```bash
-# 1. Clone the repository
-git clone https://github.com/metabbe3/GoAgent.git
-cd GoAgent
-
-# 2. Get your bot token from @BotFather on Telegram (https://t.me/BotFather)
-
-# 3. Run the interactive installer (sets up env, builds binary, installs system service)
-./deploy.sh install
-
-# 4. Check the service status
-./deploy.sh status
-
-# 5. Open Telegram, send /start to your bot, and begin chatting!
+export GOAGENT_ROLE=leader
+export GOAGENT_MESH_LISTEN=:7801
+export GOAGENT_MESH_TOKEN=secret-mesh-token-123
+export LLM_API_KEY=your-api-key
+./bin/goagent
 ```
 
----
-
-## Tools
-
-GoAgent equips the LLM with built-in tools for inspecting systems and analyzing logs:
-
-| Tool | Parameters | Description |
-| :--- | :--- | :--- |
-| `analyze_logs` | `path`, `top?`, `filter_regex?`, `min_count?`, `compare_baseline?`, `window?` | High-speed chunk-parallel log analysis. Clusters logs into normalized templates, calculates severity distributions, autodetects formats, detects bursts, correlates sequential events, and flags anomalies. |
-| `log_timeline` | `path`, `pattern_regex?`, `around_line?`, `context?` | Inspects surrounding context lines ($\pm N$, up to 50 lines max) around a specific line number or first pattern match, with automatic secret redaction. |
-| `read_log` | `path`, `tail?`, `filter_regex?` | Reads the most recent lines of a log file with optional regex filtering. |
-| `learned_patterns` | `file?` | Retrieves historical pattern memory and frequency statistics across past analyses. |
-| `read_file` | `path`, `offset?`, `limit?` | Reads lines from a file with pagination support (guarded by allowed roots). |
-| `write_file` | `path`, `content` | Writes text content to a file, automatically creating parent directories. |
-| `list_dir` | `path?` | Lists directory contents with file size, permissions, and timestamps. |
-| `run_command` | `cmd`, `timeout_sec?` | Executes diagnostic shell commands. Enforces permanent destructive command blocklist and safe diagnostic allowlist. |
-
----
-
-## Log Intelligence v2
-
-The v0.2 log engine brings Hermes-grade pattern intelligence to unstructured logs:
-
-### 1. Format Autodetection
-The engine automatically samples the first 100 lines to determine the log format without manual configuration:
-- `json`: Lines parsed as structured JSON; extracts severity level (`level`, `lvl`, `severity`), timestamps (`ts`, `time`, `@timestamp`), and normalizes messages (`msg`, `message`, `error`).
-- `logfmt`: Key-value pairs (`key=value`, `key="value"`); extracts level and normalizes dynamic values.
-- `apache/nginx`: Combined Log Format; clusters HTTP request methods, paths, and status codes (5xx $\to$ ERROR, 4xx $\to$ WARN, 2xx/3xx $\to$ INFO).
-- `syslog`: Standard RFC 3164/5424 syslog lines.
-- `raw`: General unstructured log fallback.
-
-### 2. Frequency Burst Detection (`burst.go`)
-- Calculates a dynamic baseline across time windows (1-minute buckets, or 1-hour buckets for files spanning $>24$ hours).
-- Computes mean and standard deviation per pattern across the timeline.
-- Flags anomalous spikes where $\text{count} > \text{mean} + 3\sigma$ and $\text{count} \ge 5$, outputting top bursts ranked by $z$-score.
-
-### 3. Sequential Event Correlation (`correlation.go`)
-- Tracks consecutive lines across parsed timestamps.
-- Identifies pairs of distinct patterns $(A \to B)$ that repeatedly occur within $\pm 2$ seconds of each other.
-- Filters pairs with frequency $\ge 3$ and reports average time delta in milliseconds.
-
-### 4. 30-Day Historical Baseline Delta (`learn.go`)
-- Maintains 30-day rolling daily occurrence counters (`daily: {"YYYY-MM-DD": count}`).
-- When `compare_baseline=true` is requested in `analyze_logs`:
-  - Patterns exceeding $2\times$ historical daily average are flagged with `spike: true`.
-  - Patterns dropping below $0.5\times$ historical daily average are flagged with `drop: true`.
-
----
-
-## Guardrail Security Layer ("Tidak Ada Yang Keluar")
-
-GoAgent v0.2 enforces a multi-layered guardrail boundary (`internal/guardrail/`):
-
-```
-Tool Execution  ──> [Secret Redaction] ──> [Truncation (8KB)] ──> LLM Context
-                                                                        │
-Telegram User   <── [Cap (3800)] <── [Leak Filter] <── [Markup Strip] <──┘
-```
-
-1. **Secret Redaction Pipeline (`secretredact.go`)**:
-   - Redacts sensitive credentials in **all tool outputs** before entering LLM context and in **all replies** before transmission.
-   - Detects API keys: OpenAI (`sk-`), GitHub (`ghp_`, `gho_`, `github_pat_`), AWS (`AKIA`), Slack (`xoxb-`, `xoxp-`), Google (`AIza`).
-   - Detects Bearer tokens and JSON Web Tokens (JWT).
-   - Redacts passwords in database connection strings (`postgres://`, `mysql://`, `mongodb://`, `redis://`, `amqp://`).
-   - Replaces entire private key blocks (`-----BEGIN ... PRIVATE KEY-----`).
-   - Redacts `password=`, `passwd=`, `secret=`, `token=`, `api_key=` assignments.
-   - Replaces email addresses with `[REDACTED:email]`.
-   - Validates credit card numbers with the Luhn checksum algorithm before redacting (`[REDACTED:card]`).
-   - Preserves IPv4 addresses for log analysis by default, with optional masking (`x.x.x.<last-octet>`) via `GOAGENT_MASK_IP=true`.
-
-2. **No-Leak Reply Filter (`replyfilter.go`)**:
-   - Strips internal reasoning markup, HTML comments (`<!-- ... -->`), `<s>` thought tags, raw `system:` lines, and tool-call code blocks.
-   - Replaces accidental system prompt disclosures ("You are GoAgent", "ATURAN", etc.) with safe placeholders.
-   - Enforces a 3800-character cap per reply with a `_(truncated — type "more")_` footer.
-
-3. **Command Guard (`commandguard.go`)**:
-   - Blocklist permanently rejected commands even when `GOAGENT_ALLOW_SHELL=true`:
-     `rm -rf`, `mkfs`, `dd if=.*of=/dev/`, `sudo`, `curl|sh`, `wget|sh`, `> /dev/sd*`, `chmod 777 /`, `shutdown`, `reboot`, `:(){ :|:& };:`.
-   - Default safe mode restricts execution to read-only diagnostics (`ls`, `cat`, `grep`, `tail`, `head`, `ps`, `df`, `du`, `stat`, etc.) and forbids file redirection (`>`).
-
-4. **Path Guard (`pathguard.go`)**:
-   - Validates that all file operations resolve within authorized root directories (`GOAGENT_ALLOWED_ROOTS`).
-   - Evaluates symlinks; symlinks escaping authorized roots are rejected.
-   - Forbids reading `.env*` files by default unless `GOAGENT_ALLOW_ENV=true`.
-
----
-
-## Agent Loop (Hermes-Grade)
-
-- **Parallel Tool Execution**: When the LLM outputs multiple tool calls in a single step, GoAgent executes them concurrently using a goroutine worker pool (max 4 concurrent) while preserving the original deterministic slice order.
-- **Tool Result Truncation**: Tool outputs are capped at 8,000 bytes with a truncation footer to avoid context blowing.
-- **Context Budget Pruning**: If conversation history exceeds 60,000 characters, GoAgent automatically replaces the oldest tool outputs with `[tool result omitted]`, preserving user instructions and assistant conclusions.
-
----
-
-## Configuration
-
-Settings are loaded from `goagent.env` in the current working directory and can be overridden by system environment variables:
-
-| Variable | Default | Description |
-| :--- | :--- | :--- |
-| `TELEGRAM_TOKEN` | *Required* | Telegram Bot API token obtained from [@BotFather](https://t.me/BotFather). |
-| `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint (OpenAI, Ollama, Groq, OpenRouter, vLLM). |
-| `LLM_API_KEY` | *(empty)* | API key for the LLM provider. |
-| `LLM_MODEL` | `gpt-4o-mini` | Model name for completions and function calling. |
-| `GOAGENT_ADMIN_CHAT_ID` | *(empty)* | Optional Telegram chat ID. When set, only messages from this ID are answered. |
-| `GOAGENT_ALLOW_SHELL` | `false` | When `true`, enables arbitrary shell execution (destructive blocklist still enforced). |
-| `GOAGENT_MAX_ITER` | `8` | Maximum tool execution loop iterations per user prompt. |
-| `GOAGENT_MASK_IP` | `false` | When `true`, masks IPv4 addresses to `x.x.x.<last-octet>`. |
-| `GOAGENT_ALLOWED_ROOTS` | `cwd:/var/log:/tmp:~/Library/Logs:~/.goagent` | Colon-separated allowed filesystem roots for file and log tools. |
-| `GOAGENT_ALLOW_ENV` | `false` | When `true`, permits reading `.env*` files. |
-
----
-
-## Service Management (`deploy.sh`)
-
-The `./deploy.sh` script automates cross-platform service management (macOS launchd and Linux systemd):
-
+### Terminal 2: Worker 1 (Log Specialist)
 ```bash
-./deploy.sh build     # Compile binary to bin/goagent
-./deploy.sh install   # Interactive setup and system service installation
-./deploy.sh start     # Start background daemon
-./deploy.sh stop      # Stop background daemon
-./deploy.sh restart   # Restart background daemon
-./deploy.sh status    # Check service status
-./deploy.sh logs      # Stream live logs (tail -f /tmp/goagent.log or journalctl)
+export GOAGENT_ROLE=worker
+export GOAGENT_LEADER_ADDR=http://127.0.0.1:7801
+export GOAGENT_MESH_TOKEN=secret-mesh-token-123
+export GOAGENT_WORKER_ID=worker-logs
+export GOAGENT_CAPABILITIES=logs
+export LLM_API_KEY=your-api-key
+./bin/goagent
 ```
+
+### Terminal 3: Worker 2 (Diagnostics Specialist)
+```bash
+export GOAGENT_ROLE=worker
+export GOAGENT_LEADER_ADDR=http://127.0.0.1:7801
+export GOAGENT_MESH_TOKEN=secret-mesh-token-123
+export GOAGENT_WORKER_ID=worker-shell
+export GOAGENT_CAPABILITIES=shell
+export LLM_API_KEY=your-api-key
+./bin/goagent
+```
+
+---
+
+## Configuration Reference
+
+Settings are loaded from `goagent.env` or system environment variables:
+
+| Variable | Default | Mode | Description |
+| :--- | :--- | :--- | :--- |
+| `GOAGENT_ROLE` | `solo` | All | Operating mode: `solo`, `leader`, or `worker`. |
+| `GOAGENT_MESH_LISTEN` | `:7801` | Leader | TCP address the leader HTTP server listens on. |
+| `GOAGENT_MESH_TOKEN` | *(empty)* | Leader/Worker | Shared authentication token (mandatory for leader and worker). |
+| `GOAGENT_LEADER_ADDR` | *(empty)* | Worker | Leader base URL (e.g. `http://192.168.1.10:7801`). |
+| `GOAGENT_WORKER_ID` | `hostname-pid`| Worker | Unique identifier for the worker node. |
+| `GOAGENT_CAPABILITIES`| *(empty)* | Worker | Comma-separated capability tags (e.g. `logs,files,shell`). |
+| `GOAGENT_TASK_TIMEOUT`| `300s` | Leader | Maximum time permitted for a single subtask execution. |
+| `GOAGENT_MISSION_TIMEOUT`| `1800s` | Leader | Maximum total lifecycle for a distributed mission. |
+| `TELEGRAM_TOKEN` | *(empty)* | Solo / Dual | Telegram Bot API token. Required in solo mode; optional in leader/worker. |
+| `LLM_BASE_URL` | `https://api.openai.com/v1` | All | OpenAI-compatible endpoint URL. |
+| `LLM_API_KEY` | *(empty)* | All | API key for the LLM provider. |
+| `LLM_MODEL` | `gpt-4o-mini` | All | Primary model used for reasoning and completions. |
+| `LLM_HEAVY_MODEL` | *(empty)* | All | Escalation model for complex turns (retry with half budget on failure). |
+| `LLM_EMBED_URL` | *(empty)* | All | Custom OpenAI-compatible embedding endpoint URL. |
+| `LLM_EMBED_MODEL` | *(empty)* | All | Model name for vector embeddings in knowledge base RAG. |
+| `GOAGENT_ADMIN_CHAT_ID`| `0` | All | Restrict Telegram responses to a specific chat ID. |
+| `GOAGENT_ALLOW_SHELL` | `false` | All | Enable arbitrary command execution (destructive commands still blocked). |
+| `GOAGENT_MAX_ITER` | `8` | All | Maximum agent tool loop iterations per turn. |
+| `GOAGENT_MASK_IP` | `false` | All | Mask IPv4 addresses (`x.x.x.<last-octet>`) in outputs. |
+| `GOAGENT_ALLOWED_ROOTS`| `.` | All | Colon-separated filesystem boundaries for file tools. |
+| `GOAGENT_ALLOW_ENV` | `false` | All | Permit reading `.env` files. |
+
+---
+
+## Built-in Tools
+
+GoAgent includes built-in tools implemented strictly with the Go standard library:
+
+### Universal & Diagnostic Tools
+| Tool | Description |
+| :--- | :--- |
+| `analyze_logs` | Chunk-parallel log analyzer. Template clustering, burst detection, event correlation, and baseline deltas. |
+| `log_timeline` | Extracts surrounding lines around a specific match or line number with secret redaction. |
+| `read_log` | Reads the tail of a log file with optional regex filtering. |
+| `learned_patterns` | Inspects historically learned pattern templates. |
+| `read_file` | Reads paginated file contents within authorized roots. |
+| `write_file` | Writes text content, creating parent directories atomically. |
+| `list_dir` | Lists directories with file metadata and permissions. |
+| `run_command` | Executes diagnostic shell commands with allowlist protection. |
+| `fetch_url` | Fetches public HTTP(S) URLs, strips markup, and applies SSRF protection against loopback/private IPs. |
+| `read_document` | Extracts text from `.docx`, `.xlsx`, `.pdf`, `.txt`, `.md`, `.csv`, `.json`, `.log` files without external libraries. |
+| `save_knowledge` | Stores reference documents into the local RAG knowledge base. |
+| `search_knowledge` | Performs cosine similarity top-k search with a 0.35 similarity floor over embedded documents. |
+| `generate_pdf` | Generates formatted A4 PDF reports with page numbers and Latin-1 typography. CJK characters are guarded. |
+
+### Leader Orchestration Tools (Role: Leader only)
+| Tool | Description |
+| :--- | :--- |
+| `delegate_task` | Splits a high-level mission into subtasks with capability requirements. |
+| `list_workers` | Lists connected workers, capabilities, in-flight work, and last seen timestamps. |
+| `mission_status` | Returns complete status and state tree for a mission. |
+| `cancel_mission` | Cancels pending and in-flight subtasks for a mission. |
+| `collect_results` | Aggregates completed subtask outputs for leader synthesis. |
+| `mesh_info` | Displays cluster configuration and active task counts. |
+
+---
+
+## Security & Guardrails
+
+GoAgent enforces defense-in-depth security at every step:
+- **Secret Redaction**: Automatic detection and redaction of API keys, private keys, passwords, database URLs, cards, and tokens before entering LLM context and before leaving the agent.
+- **Untrusted Content Framing**: Content from `fetch_url` and `read_document` is wrapped with `FrameDocumentContent` (`· ` prefix per line) so embedded prompt injections are processed as DATA, never instructions.
+- **SSRF Guard**: Custom HTTP dialer rejects loopback (`127.0.0.0/8`), private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local, multicast, and carrier-grade NAT addresses post-DNS.
+- **Path & Command Guard**: Restricts file access to authorized roots and forbids destructive shell commands (`rm -rf`, `mkfs`, fork bombs, etc.).
+
+---
+
+## Extending GoAgent
+
+1. **Adding Tools**:
+   Create a new file in `internal/tools/` and register your function in `r.Register()` using `llm.ToolDefinition`.
+2. **Adding Capabilities**:
+   Tag worker nodes using `GOAGENT_CAPABILITIES=gpu,vision,storage`. Subtasks specifying `capability: "gpu"` will only route to workers matching that tag.
+3. **Transport Adapters**:
+   GoMesh uses clean HTTP/1.1 and JSON-RPC 2.0. To bridge GoMesh across custom overlays (WireGuard, Tailscale, mTLS, WebSocket), wrap `net.Listener` in `Server` or provide a custom `http.RoundTripper` in `Client`.
+4. **TODO: Deck / Slide Presentation Generator**:
+   The `generate_pdf` tool provides pure-Go document rendering. A standalone slide deck generator (PPTX) can be added as an extension point using standard OOXML zip generation.
 
 ---
 

@@ -116,3 +116,80 @@ func TestChatCompletionMockServer(t *testing.T) {
 		t.Errorf("unexpected message content: %s", msg.Content)
 	}
 }
+
+func TestChatCompletionHeavy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Model != "heavy-model-pro" {
+			t.Errorf("expected model heavy-model-pro, got %s", req.Model)
+		}
+
+		resp := ChatResponse{
+			ID: "chatcmpl-heavy",
+			Choices: []ChatChoice{
+				{
+					Index: 0,
+					Message: ChatMessage{
+						Role:    "assistant",
+						Content: "Solved on heavy model!",
+					},
+					FinishReason: "stop",
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		LLMBaseURL:    server.URL,
+		LLMAPIKey:     "test-key",
+		LLMModel:      "small-model",
+		LLMHeavyModel: "heavy-model-pro",
+	}
+
+	client := NewClient(cfg)
+	msg, err := client.ChatCompletionHeavy(context.Background(), []ChatMessage{
+		{Role: "user", Content: "Hard problem"},
+	}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msg.Content != "Solved on heavy model!" {
+		t.Errorf("unexpected heavy content: %s", msg.Content)
+	}
+}
+
+func TestEmbeddings(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/embeddings" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		resp := map[string]any{
+			"data": []map[string]any{
+				{"index": 0, "embedding": []float32{0.1, 0.2, 0.3}},
+				{"index": 1, "embedding": []float32{0.4, 0.5, 0.6}},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		LLMBaseURL:    server.URL,
+		LLMEmbedModel: "text-embedding-3-small",
+	}
+	client := NewClient(cfg)
+	vecs, err := client.Embed(context.Background(), []string{"one", "two"})
+	if err != nil {
+		t.Fatalf("embed failed: %v", err)
+	}
+	if len(vecs) != 2 || len(vecs[0]) != 3 {
+		t.Fatalf("unexpected vecs output: %v", vecs)
+	}
+}

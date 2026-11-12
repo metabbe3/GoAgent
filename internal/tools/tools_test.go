@@ -137,7 +137,7 @@ func TestRunCommandTimeout(t *testing.T) {
 	}
 }
 
-func TestReadLogAndAnalyzeLogs(t *testing.T) {
+func TestReadLogAndLogAnalysis(t *testing.T) {
 	tmpDir := t.TempDir()
 	logFile := filepath.Join(tmpDir, "server.log")
 
@@ -210,5 +210,64 @@ func TestReadLogAndAnalyzeLogs(t *testing.T) {
 	}
 	if !strings.Contains(tlRes, "connection lost") {
 		t.Errorf("expected target line in timeline output, got: %s", tlRes)
+	}
+}
+
+func TestReadDocument(t *testing.T) {
+	tmpDir := t.TempDir()
+	docFile := filepath.Join(tmpDir, "sample.md")
+	_ = os.WriteFile(docFile, []byte("# Overview\nSystem diagnostics healthy"), 0o644)
+
+	reg := NewRegistry(nil)
+	args, _ := json.Marshal(map[string]string{"path": docFile})
+	res, err := reg.Execute("read_document", string(args))
+	if err != nil {
+		t.Fatalf("read_document failed: %v", err)
+	}
+	if !strings.Contains(res, "[document content from file sample.md") {
+		t.Errorf("expected framed document header, got %s", res)
+	}
+	if !strings.Contains(res, "System diagnostics healthy") {
+		t.Errorf("expected content in response, got %s", res)
+	}
+}
+
+func TestGeneratePDF(t *testing.T) {
+	tmpDir := t.TempDir()
+	reg := NewRegistry(nil)
+	reg.registerGenerateTools(tmpDir)
+
+	args, _ := json.Marshal(map[string]string{
+		"title":    "Diagnostic Report",
+		"markdown": "# Header\n- Finding 1\n- Finding 2\n\nAll services normal.",
+	})
+	res, err := reg.Execute("generate_pdf", string(args))
+	if err != nil {
+		t.Fatalf("generate_pdf failed: %v", err)
+	}
+	if !strings.Contains(res, "[generated-file:") {
+		t.Errorf("missing generated file marker: %s", res)
+	}
+
+	// Verify CJK rejection
+	cjkArgs, _ := json.Marshal(map[string]string{
+		"title":    "Report",
+		"markdown": "测试中文",
+	})
+	cjkRes, _ := reg.Execute("generate_pdf", string(cjkArgs))
+	if !strings.Contains(cjkRes, "Chinese/Japanese/Korean text") {
+		t.Errorf("expected CJK rejection error, got: %s", cjkRes)
+	}
+}
+
+func TestFetchURLSSRFBlocked(t *testing.T) {
+	reg := NewRegistry(nil)
+	args, _ := json.Marshal(map[string]string{"url": "http://127.0.0.1:9999/admin"})
+	res, err := reg.Execute("fetch_url", string(args))
+	if err != nil {
+		t.Fatalf("unexpected handler err: %v", err)
+	}
+	if !strings.Contains(res, "SSRF guard") && !strings.Contains(res, "not a public IP") {
+		t.Errorf("expected SSRF block message, got: %s", res)
 	}
 }

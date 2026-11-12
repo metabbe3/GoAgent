@@ -235,3 +235,96 @@ func TestContextBudgetPruning(t *testing.T) {
 		t.Errorf("user or assistant message content was corrupted during pruning")
 	}
 }
+
+func TestToolPanicRecover(t *testing.T) {
+	step := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		step++
+		var resp llm.ChatResponse
+		if step == 1 {
+			resp = llm.ChatResponse{
+				Choices: []llm.ChatChoice{
+					{
+						Message: llm.ChatMessage{
+							Role: "assistant",
+							ToolCalls: []llm.ToolCall{
+								{
+									ID:   "call_panic",
+									Type: "function",
+									Function: llm.FunctionCall{
+										Name:      "panic_tool",
+										Arguments: "{}",
+									},
+								},
+							},
+						},
+						FinishReason: "tool_calls",
+					},
+				},
+			}
+		} else {
+			resp = llm.ChatResponse{
+				Choices: []llm.ChatChoice{
+					{
+						Message: llm.ChatMessage{
+							Role:    "assistant",
+							Content: "Recovered from panic.",
+						},
+						FinishReason: "stop",
+					},
+				},
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		LLMBaseURL: server.URL,
+		LLMAPIKey:  "key",
+		LLMModel:   "model",
+	}
+	llmClient := llm.NewClient(cfg)
+	reg := tools.NewRegistry(cfg)
+
+	// Register a tool that deliberately panics
+	reg.Register(llm.ToolDefinition{
+		Type:     "function",
+		Function: llm.ToolFunctionDef{Name: "panic_tool"},
+	}, func(args string) (string, error) {
+		panic("simulated explosion")
+	})
+
+	agentLoop := NewLoop(llmClient, reg, 5)
+	reply, msgs, err := agentLoop.Run(context.Background(), "test panic", nil)
+	if err != nil {
+		t.Fatalf("agent should not crash on tool panic: %v", err)
+	}
+	if reply != "Recovered from panic." {
+		t.Errorf("unexpected reply: %s", reply)
+	}
+
+	foundToolErr := false
+	for _, m := range msgs {
+		if m.Role == "tool" && strings.Contains(m.Content, "Error: internal tool failure") {
+			foundToolErr = true
+			break
+		}
+	}
+	if !foundToolErr {
+		t.Errorf("tool result did not capture recovered panic error")
+	}
+}
+
+func TestHourPrecisionClock(t *testing.T) {
+	loop := NewLoop(nil, tools.NewRegistry(nil), 5)
+	sys := loop.buildSystemPrompt()
+
+	if !strings.Contains(sys, "Current date/time (hour precision):") {
+		t.Fatalf("system prompt missing hour precision clock header: %s", sys)
+	}
+	if !strings.Contains(sys, "h UTC") {
+		t.Fatalf("clock format should contain 'h UTC', got: %s", sys)
+	}
+}
